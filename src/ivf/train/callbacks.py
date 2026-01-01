@@ -2,6 +2,7 @@
 Training callbacks for lightweight progress logging.
 """
 
+from pathlib import Path
 import time
 from typing import Optional
 
@@ -23,6 +24,71 @@ class StepProgressLogger(pl.Callback):
         now = time.time()
         self._last_time = now
         self._last_step = trainer.global_step
+
+
+class BestMetricCheckpoint(pl.Callback):
+    """
+    Save the best checkpoint based on a primary metric, with fallback to another metric.
+    """
+
+    def __init__(
+        self,
+        ckpt_path: Path,
+        primary_metric: str,
+        fallback_metric: str,
+        primary_mode: str = "max",
+        fallback_mode: str = "min",
+    ) -> None:
+        self.ckpt_path = Path(ckpt_path)
+        self.primary_metric = primary_metric
+        self.fallback_metric = fallback_metric
+        self.primary_mode = primary_mode
+        self.fallback_mode = fallback_mode
+        self.best_score: Optional[float] = None
+        self.best_metric_name: Optional[str] = None
+
+    def _select_metric(self, metrics) -> tuple[Optional[str], Optional[float], Optional[str]]:
+        if self.primary_metric in metrics:
+            value = metrics[self.primary_metric]
+            try:
+                score = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
+                return self.primary_metric, score, self.primary_mode
+            except (TypeError, ValueError):
+                pass
+        if self.fallback_metric in metrics:
+            value = metrics[self.fallback_metric]
+            try:
+                score = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
+                return self.fallback_metric, score, self.fallback_mode
+            except (TypeError, ValueError):
+                pass
+        return None, None, None
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if getattr(trainer, "sanity_checking", False):
+            return
+        metric_name, score, mode = self._select_metric(trainer.callback_metrics)
+        if metric_name is None or score is None or mode is None:
+            return
+
+        improved = False
+        if self.best_score is None:
+            improved = True
+        elif mode == "max" and score > self.best_score:
+            improved = True
+        elif mode == "min" and score < self.best_score:
+            improved = True
+
+        if improved:
+            trainer.save_checkpoint(str(self.ckpt_path))
+            self.best_score = score
+            self.best_metric_name = metric_name
+            get_logger("ivf").info(
+                "Saved best checkpoint to %s (metric=%s score=%.4f).",
+                self.ckpt_path,
+                metric_name,
+                score,
+            )
 
     def on_train_batch_end(
         self,

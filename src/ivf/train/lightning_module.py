@@ -27,6 +27,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         weight_decay: float = 1e-4,
         loss_weights: Optional[Dict[str, float]] = None,
         freeze_config: Optional[Dict] = None,
+        morph_loss_reduction: str = "mean",
+        quality_pos_weight: Optional[float] = None,
         live_epoch_line: bool = False,
     ) -> None:
         super().__init__()
@@ -36,8 +38,13 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.loss_weights = loss_weights or {"morph": 1.0, "stage": 1.0, "quality": 1.0}
         self.freeze_config = freeze_config or {}
+        self.morph_loss_reduction = morph_loss_reduction
+        self.quality_pos_weight = quality_pos_weight
         self.live_epoch_line = live_epoch_line
         self._epoch_start_time = None
+
+        if self.morph_loss_reduction not in {"mean", "sum"}:
+            raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
 
         self._apply_phase_freeze(initial=True)
 
@@ -156,8 +163,17 @@ class MultiTaskLightningModule(pl.LightningModule):
         assert_no_day_feature(batch)
         assert_no_segmentation_inputs(batch)
 
-    def _masked_ce(self, logits: torch.Tensor, targets: torch.Tensor, weight: float) -> Optional[torch.Tensor]:
-        mask = targets >= 0
+    def _masked_ce(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        weight: float,
+    ) -> Optional[torch.Tensor]:
+        if mask is None:
+            mask = targets >= 0
+        else:
+            mask = mask > 0
         if not mask.any():
             return None
         return F.cross_entropy(logits[mask], targets[mask]) * weight
@@ -166,22 +182,60 @@ class MultiTaskLightningModule(pl.LightningModule):
         losses = {}
 
         if self.phase in {"morph", "joint"}:
-            loss_exp = self._masked_ce(outputs["morph"]["exp"], targets["exp"], self.loss_weights.get("morph", 1.0))
-            loss_icm = self._masked_ce(outputs["morph"]["icm"], targets["icm"], self.loss_weights.get("morph", 1.0))
-            loss_te = self._masked_ce(outputs["morph"]["te"], targets["te"], self.loss_weights.get("morph", 1.0))
+            loss_exp = self._masked_ce(
+                outputs["morph"]["exp"],
+                targets["exp"],
+                targets.get("exp_mask"),
+                self.loss_weights.get("morph", 1.0),
+            )
+            loss_icm = self._masked_ce(
+                outputs["morph"]["icm"],
+                targets["icm"],
+                targets.get("icm_mask"),
+                self.loss_weights.get("morph", 1.0),
+            )
+            loss_te = self._masked_ce(
+                outputs["morph"]["te"],
+                targets["te"],
+                targets.get("te_mask"),
+                self.loss_weights.get("morph", 1.0),
+            )
             morph_losses = [l for l in [loss_exp, loss_icm, loss_te] if l is not None]
             if morph_losses:
-                losses["morphology"] = sum(morph_losses)
+                total = sum(morph_losses)
+                if self.morph_loss_reduction == "mean":
+                    total = total / len(morph_losses)
+                losses["morphology"] = total
 
         if self.phase in {"stage", "joint"}:
-            stage_loss = self._masked_ce(outputs["stage"], targets["stage"], self.loss_weights.get("stage", 1.0))
+            stage_loss = self._masked_ce(
+                outputs["stage"],
+                targets["stage"],
+                None,
+                self.loss_weights.get("stage", 1.0),
+            )
             if stage_loss is not None:
                 losses["stage"] = stage_loss
 
         if self.phase == "quality":
-            quality_loss = self._masked_ce(outputs["quality"], targets["quality"], self.loss_weights.get("quality", 1.0))
-            if quality_loss is not None:
-                losses["quality"] = quality_loss
+            weight = self.loss_weights.get("quality", 1.0)
+            if self.quality_pos_weight is not None:
+                logits = outputs["quality"][:, 1] - outputs["quality"][:, 0]
+                t = targets["quality"].float()
+                mask = t >= 0
+                if mask.any():
+                    pos_weight = torch.tensor(self.quality_pos_weight, device=logits.device)
+                    loss = F.binary_cross_entropy_with_logits(logits[mask], t[mask], pos_weight=pos_weight)
+                    losses["quality"] = loss * weight
+            else:
+                quality_loss = self._masked_ce(
+                    outputs["quality"],
+                    targets["quality"],
+                    None,
+                    weight,
+                )
+                if quality_loss is not None:
+                    losses["quality"] = quality_loss
 
         total = sum(losses.values()) if losses else torch.tensor(0.0, device=outputs["features"].device)
         losses["total"] = total
@@ -218,7 +272,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             for key, metric in self.morph_metrics.items():
                 head = key.split("_")[0]
                 t = targets[head]
-                mask = t >= 0
+                mask = targets.get(f"{head}_mask")
+                mask = mask > 0 if mask is not None else t >= 0
                 if mask.any():
                     preds = outputs["morph"][head].argmax(dim=-1)
                     metric.update(preds[mask], t[mask])
@@ -237,7 +292,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             t = targets["quality"]
             mask = t >= 0
             if mask.any():
-                probs = F.softmax(outputs["quality"], dim=-1)[:, 1]
+                logits = outputs["quality"][:, 1] - outputs["quality"][:, 0]
+                probs = torch.sigmoid(logits)
                 for key, metric in self.quality_metrics.items():
                     metric.update(probs[mask], t[mask])
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False)

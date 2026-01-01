@@ -41,11 +41,12 @@ def test_quality_unknown_or_invalid_returns_none(gardner):
 
 def test_morphology_targets_mapping_is_consistent():
     targets = gardner_to_morphology_targets("4AA")
-    assert targets == {
-        "exp": EXPANSION_TO_ID[4],
-        "icm": ICM_TO_ID["A"],
-        "te": TE_TO_ID["A"],
-    }
+    assert targets["exp"] == EXPANSION_TO_ID[4]
+    assert targets["icm"] == ICM_TO_ID["A"]
+    assert targets["te"] == TE_TO_ID["A"]
+    assert targets["exp_mask"] == 1
+    assert targets["icm_mask"] == 1
+    assert targets["te_mask"] == 1
 
 
 def test_morphology_targets_invalid_grade_raises():

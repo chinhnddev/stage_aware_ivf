@@ -33,17 +33,27 @@ def _coerce_int(value) -> Optional[int]:
         return None
 
 
+def _coerce_grade(value) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    if text in {"A", "B", "C"}:
+        return text
+    num = _coerce_int(value)
+    if num is None:
+        return None
+    return ICM_TE_MAP.get(num)
+
+
 def _build_gardner(exp_val, icm_val, te_val) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
     exp = _coerce_int(exp_val)
+    icm_grade = _coerce_grade(icm_val)
+    te_grade = _coerce_grade(te_val)
     icm = _coerce_int(icm_val)
     te = _coerce_int(te_val)
-    if exp is None or icm is None or te is None:
+    if exp is None or icm_grade is None or te_grade is None:
         return None, exp, icm, te
     if exp < 1 or exp > 6:
-        return None, exp, icm, te
-    icm_grade = ICM_TE_MAP.get(icm)
-    te_grade = ICM_TE_MAP.get(te)
-    if icm_grade is None or te_grade is None:
         return None, exp, icm, te
     return f"{exp}{icm_grade}{te_grade}", exp, icm, te
 

@@ -7,3 +7,4 @@ pytorch-lightning>=2.0
 torchmetrics>=1.0
 omegaconf>=2.3
 tensorboard>=2.0
+scikit-learn>=1.2

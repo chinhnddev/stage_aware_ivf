@@ -44,32 +44,16 @@ def parse_args():
 def _resolve_group_col(df: pd.DataFrame, cfg: dict) -> str:
     split_cfg = cfg.get("split", {}) or {}
     group_col = split_cfg.get("group_col")
-    id_col = cfg.get("id_col")
-
-    if group_col and group_col in df.columns:
-        missing_frac = float(df[group_col].isna().mean())
-        if missing_frac <= MISSINGNESS_THRESHOLD:
-            return group_col
-        print(
-            f"Warning: group_col '{group_col}' missingness {missing_frac:.1%} too high; "
-            f"falling back to id_col '{id_col}'."
-        )
-    elif group_col:
-        print(f"Warning: group_col '{group_col}' missing; falling back to id_col '{id_col}'.")
-
-    fallback_col = id_col if id_col in df.columns else None
-    if fallback_col is None and "id" in df.columns:
-        fallback_col = "id"
-        if id_col and id_col != "id":
-            print(f"Warning: id_col '{id_col}' missing; falling back to 'id'.")
-
-    if fallback_col is None:
-        raise ValueError("Fallback id_col is missing; cannot perform group-wise split.")
-
-    missing_frac = float(df[fallback_col].isna().mean())
+    if not group_col:
+        raise ValueError("split.group_col is required for leakage-safe grouping.")
+    if group_col not in df.columns:
+        raise ValueError(f"split.group_col '{group_col}' is missing from metadata.")
+    missing_frac = float(df[group_col].isna().mean())
     if missing_frac > MISSINGNESS_THRESHOLD:
-        print(f"Warning: id_col '{fallback_col}' missingness {missing_frac:.1%}.")
-    return fallback_col
+        raise ValueError(
+            f"split.group_col '{group_col}' missingness {missing_frac:.1%} exceeds threshold {MISSINGNESS_THRESHOLD:.1%}."
+        )
+    return group_col
 
 
 def _normalize_split_paths(df: pd.DataFrame, root_dir: str) -> pd.DataFrame:
@@ -98,18 +82,26 @@ def _normalize_split_paths(df: pd.DataFrame, root_dir: str) -> pd.DataFrame:
 
 def make_blastocyst_splits(cfg: dict):
     day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
-    raw_df = pd.read_csv(cfg["csv_path"])
-    records = load_blastocyst_records(
+    records, stats = load_blastocyst_records(
         Path(cfg["root_dir"]),
         Path(cfg["csv_path"]),
         image_col=cfg["image_col"],
         grade_col=cfg["label_col"],
         id_col=cfg["id_col"],
         day_col=day_col,
+        return_stats=True,
+        log_stats=False,
     )
-    invalid_count = max(len(raw_df) - len(records), 0)
-    if invalid_count:
-        print(f"Blastocyst invalid Gardner labels: {invalid_count}/{len(raw_df)}")
+    dropped_total = stats.dropped_range_label + stats.missing_exp + stats.invalid_exp
+    print(f"Blastocyst Gardner parsing stats: {stats.as_dict()}")
+    if dropped_total:
+        print(f"Blastocyst dropped Gardner labels: {dropped_total}/{stats.total}")
+    if stats.dropped_range_label:
+        print(f"  - dropped_range_label: {stats.dropped_range_label}")
+    if stats.missing_exp:
+        print(f"  - missing_exp: {stats.missing_exp}")
+    if stats.invalid_exp:
+        print(f"  - invalid_exp: {stats.invalid_exp}")
     df = records_to_dataframe(records)
     df = _normalize_split_paths(df, cfg["root_dir"])
     split_cfg = cfg.get("split", {})

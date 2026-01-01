@@ -12,7 +12,7 @@ Hard rules: day metadata must not be used as model input and segmentation masks 
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 class StageLabel(str, Enum):
@@ -48,7 +48,72 @@ STAGE_TO_ID: Dict[StageLabel, int] = {stage: idx for idx, stage in enumerate(STA
 QUALITY_CLASSES = [QualityLabel.POOR, QualityLabel.GOOD]
 QUALITY_TO_ID: Dict[QualityLabel, int] = {label: idx for idx, label in enumerate(QUALITY_CLASSES)}
 
-_GARDNER_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc])(?P<te>[ABCabc])\s*$")
+MISSING_GARDNER_TOKENS = {"", "0", "ND", "NA", "N/A"}
+ICM_TE_NUMERIC_MAP = {1: "A", 2: "B", 3: "C"}
+
+_GARDNER_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])(?P<te>[ABCabc123])\s*$")
+_GARDNER_COMPONENT_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])?(?P<te>[ABCabc123])?\s*$")
+_GARDNER_RANGE_PATTERN = re.compile(r"\d\s*-\s*\d")
+
+
+def is_gardner_range_label(gardner: Optional[str]) -> bool:
+    if gardner is None:
+        return False
+    return bool(_GARDNER_RANGE_PATTERN.search(str(gardner)))
+
+
+def _is_missing_token(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (int, float)) and value == 0:
+        return True
+    if isinstance(value, float) and value != value:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return text.upper() in MISSING_GARDNER_TOKENS
+
+
+def normalize_gardner_exp(value) -> Optional[int]:
+    if _is_missing_token(value):
+        return None
+    try:
+        exp = int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+    if exp < 1 or exp > 6:
+        return None
+    return exp
+
+
+def normalize_gardner_grade(value) -> Optional[str]:
+    if _is_missing_token(value):
+        return None
+    text = str(value).strip().upper()
+    if text in {"A", "B", "C"}:
+        return text
+    try:
+        num = int(float(text))
+    except (ValueError, TypeError):
+        return None
+    return ICM_TE_NUMERIC_MAP.get(num)
+
+
+def parse_gardner_components(gardner: Optional[str]) -> Optional[Tuple[int, Optional[str], Optional[str]]]:
+    if gardner is None:
+        return None
+    if is_gardner_range_label(gardner):
+        return None
+    match = _GARDNER_COMPONENT_PATTERN.match(str(gardner))
+    if not match:
+        return None
+    exp = normalize_gardner_exp(match.group("exp"))
+    if exp is None:
+        return None
+    icm = normalize_gardner_grade(match.group("icm")) if match.group("icm") else None
+    te = normalize_gardner_grade(match.group("te")) if match.group("te") else None
+    return exp, icm, te
 
 
 def parse_gardner(gardner: str) -> Optional[GardnerComponents]:
@@ -66,8 +131,10 @@ def parse_gardner(gardner: str) -> Optional[GardnerComponents]:
         return None
 
     expansion = int(match.group("exp"))
-    icm = match.group("icm").upper()
-    te = match.group("te").upper()
+    icm = normalize_gardner_grade(match.group("icm"))
+    te = normalize_gardner_grade(match.group("te"))
+    if icm is None or te is None:
+        return None
     return GardnerComponents(expansion, icm, te)
 
 
@@ -95,19 +162,52 @@ def map_gardner_to_quality(gardner: str) -> Optional[QualityLabel]:
     return None
 
 
-def gardner_to_morphology_targets(gardner: str) -> Dict[str, int]:
+UNSET = object()
+
+
+def gardner_to_morphology_targets(
+    gardner: Optional[str],
+    exp_value=UNSET,
+    icm_value=UNSET,
+    te_value=UNSET,
+) -> Dict[str, int]:
     """
     Convert Gardner grade into morphology class IDs for expansion, ICM, and TE.
 
     Raises:
-        ValueError: if the Gardner string cannot be parsed.
+        ValueError: if the Gardner string cannot be parsed or exp is missing.
     """
-    components = parse_gardner(gardner)
-    if components is None:
-        raise ValueError(f"Cannot parse Gardner string: {gardner!r}")
+    if is_gardner_range_label(gardner):
+        raise ValueError(f"Cannot parse Gardner range label: {gardner!r}")
+
+    exp = normalize_gardner_exp(exp_value) if exp_value is not UNSET else None
+    icm = normalize_gardner_grade(icm_value) if icm_value is not UNSET else None
+    te = normalize_gardner_grade(te_value) if te_value is not UNSET else None
+
+    components = parse_gardner_components(gardner)
+    if exp is None and exp_value is UNSET and components is not None:
+        exp = components[0]
+    if icm is None and icm_value is UNSET and components is not None:
+        icm = components[1]
+    if te is None and te_value is UNSET and components is not None:
+        te = components[2]
+
+    if exp is None:
+        raise ValueError(f"Cannot parse Gardner expansion: {gardner!r}")
+
+    if exp < 3:
+        icm = None
+        te = None
+
+    exp_mask = 1
+    icm_mask = 1 if icm is not None and exp >= 3 else 0
+    te_mask = 1 if te is not None and exp >= 3 else 0
 
     return {
-        "exp": EXPANSION_TO_ID[components.expansion],
-        "icm": ICM_TO_ID[components.icm],
-        "te": TE_TO_ID[components.te],
+        "exp": EXPANSION_TO_ID[exp],
+        "icm": ICM_TO_ID[icm] if icm_mask else -1,
+        "te": TE_TO_ID[te] if te_mask else -1,
+        "exp_mask": exp_mask,
+        "icm_mask": icm_mask,
+        "te_mask": te_mask,
     }

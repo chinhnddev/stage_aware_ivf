@@ -22,10 +22,26 @@ from ivf.utils.guardrails import assert_no_day_feature, assert_no_segmentation_i
 def _normalize_quality(value) -> Optional[QualityLabel]:
     if value is None:
         return None
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return QualityLabel.GOOD if int(value) == 1 else QualityLabel.POOR
     text = str(value).strip().lower()
+    if text in {"0", "1"}:
+        return QualityLabel.GOOD if text == "1" else QualityLabel.POOR
     for label in QualityLabel:
         if label.value == text:
             return label
+    return None
+
+
+def _quality_from_path(path_value: Optional[str]) -> Optional[QualityLabel]:
+    if path_value is None:
+        return None
+    path = Path(str(path_value).replace("\\", "/"))
+    parent = path.parent.name
+    if parent == "1":
+        return QualityLabel.GOOD
+    if parent == "0":
+        return QualityLabel.POOR
     return None
 
 
@@ -64,6 +80,8 @@ def build_hungvuong_quality_dataset(
             quality_label = _normalize_quality(row.get(quality_col))
         if quality_label is None and grade_col and grade_col in df.columns:
             quality_label = map_gardner_to_quality(row.get(grade_col))
+        if quality_label is None:
+            quality_label = _quality_from_path(row.get(image_col))
 
         if quality_label is None:
             continue
@@ -85,7 +103,7 @@ def build_hungvuong_quality_dataset(
 
         records.append(
             {
-                "image_path": str(root_dir / str(row.get(image_col))),
+                "image_path": row.get(image_col),
                 "targets": targets,
                 "meta": meta,
             }
@@ -98,7 +116,7 @@ def build_hungvuong_quality_dataset(
         std=std,
     )
     assert_no_augmentation(eval_tf)
-    return BaseImageDataset(records, transform=eval_tf, include_meta_day=True)
+    return BaseImageDataset(records, transform=eval_tf, include_meta_day=True, root_dir=str(root_dir))
 
 
 def predict(model: torch.nn.Module, dataloader: DataLoader, device: torch.device) -> Dict[str, List]:

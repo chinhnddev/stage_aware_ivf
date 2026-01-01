@@ -21,7 +21,9 @@ transforms:
   stage: medium
   joint: light
   quality: light
-  normalize: false
+  normalize: true
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
 
 training:
   lr: 0.001
@@ -35,12 +37,28 @@ training:
     morph: 1.0
     stage: 1.0
     quality: 1.0
+  morph_loss_reduction: mean
+  joint_sampling: balanced
+  quality_sampling: proportional
+  require_prev_ckpt: true
   freeze:
     stage_start_ratio: 0.8
     stage_schedule:
       - [0.0, 0.8]
       - [5.0, 0.5]
       - [10.0, 0.0]
+
+quality_exp:
+  derive_quality: true
+  exp_min: 3
+  icm_good: [1, 2]
+  te_good: [1, 2]
+  split_ratios: [0.8, 0.1, 0.1]
+  group_col_candidates: [patient_id, embryo_id]
+  use_pos_weight: true
+  threshold_tuning: true
+  checkpoint_name: phase4_quality.ckpt
+  monitor_metric: val/quality_auprc
 
 logging:
   tensorboard: true

@@ -1,12 +1,19 @@
 dataset_type: quality_public
 root_dir: data/blastocyst_Dataset
 csv_path: data/metadata/quality_public.csv
+
 image_col: image_path
-label_col: gardner
+label_col: quality_label      # CHANGED: dùng nhãn good/poor đã derive
 id_col: embryo_id
 day_col: day
 include_meta_day: false
+
 split:
-  group_col: patient_id
+  group_col: embryo_id        # CHANGED: patient_id trống ở Kaggle → dùng embryo_id để tránh leakage theo ảnh cùng embryo
   val_ratio: 0.1
   test_ratio: 0.1
+
+split_files:
+  train: data/processed/quality_public_train.csv
+  val: data/processed/quality_public_val.csv
+  test: data/processed/quality_public_test.csv

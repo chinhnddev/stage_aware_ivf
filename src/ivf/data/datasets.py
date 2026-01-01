@@ -99,6 +99,8 @@ class BaseImageDataset(Dataset):
             targets = dict(targets)
             for key in TARGET_KEYS:
                 targets.setdefault(key, IGNORE_INDEX)
+            for key in MASK_KEYS:
+                targets.setdefault(key, 0)
         meta = dict(sample.get("meta", {}))
         if not self.include_meta_day:
             meta.pop("day", None)
@@ -112,19 +114,37 @@ class BaseImageDataset(Dataset):
 
 IGNORE_INDEX = -1
 TARGET_KEYS = ("exp", "icm", "te", "stage", "quality")
+MASK_KEYS = ("exp_mask", "icm_mask", "te_mask")
 
 
-def make_full_target_dict(exp=None, icm=None, te=None, stage=None, quality=None) -> MutableMapping:
+def make_full_target_dict(
+    exp=None,
+    icm=None,
+    te=None,
+    stage=None,
+    quality=None,
+    exp_mask: Optional[int] = None,
+    icm_mask: Optional[int] = None,
+    te_mask: Optional[int] = None,
+) -> MutableMapping:
     """
     Ensure each sample has a full target dict so batching works across tasks.
-    Missing targets use IGNORE_INDEX.
+    Missing targets use IGNORE_INDEX and masks default to 0.
     """
+    def _mask_value(mask, target):
+        if mask is not None:
+            return int(mask)
+        return 0 if target is None else 1
+
     return {
         "exp": IGNORE_INDEX if exp is None else exp,
         "icm": IGNORE_INDEX if icm is None else icm,
         "te": IGNORE_INDEX if te is None else te,
         "stage": IGNORE_INDEX if stage is None else stage,
         "quality": IGNORE_INDEX if quality is None else quality,
+        "exp_mask": _mask_value(exp_mask, exp),
+        "icm_mask": _mask_value(icm_mask, icm),
+        "te_mask": _mask_value(te_mask, te),
     }
 
 

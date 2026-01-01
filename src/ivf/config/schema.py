@@ -61,6 +61,10 @@ class TrainingConfig:
     weight_decay: float = 0.0001
     epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10})
     loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0})
+    morph_loss_reduction: str = "mean"
+    joint_sampling: str = "balanced"
+    quality_sampling: str = "proportional"
+    require_prev_ckpt: bool = True
     freeze: FreezeConfig = field(default_factory=FreezeConfig)
 
 
@@ -78,6 +82,20 @@ class OutputConfig:
 
 
 @dataclass
+class QualityExpConfig:
+    derive_quality: bool = True
+    exp_min: int = 3
+    icm_good: List[int] = field(default_factory=lambda: [1, 2])
+    te_good: List[int] = field(default_factory=lambda: [1, 2])
+    split_ratios: List[float] = field(default_factory=lambda: [0.8, 0.1, 0.1])
+    group_col_candidates: List[str] = field(default_factory=lambda: ["patient_id", "embryo_id"])
+    use_pos_weight: bool = True
+    threshold_tuning: bool = True
+    checkpoint_name: str = "phase4_quality.ckpt"
+    monitor_metric: str = "val/quality_auprc"
+
+
+@dataclass
 class ExperimentConfig:
     seed: int = 42
     batch_size: int = 16
@@ -89,4 +107,5 @@ class ExperimentConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     outputs: OutputConfig = field(default_factory=OutputConfig)
+    quality_exp: QualityExpConfig = field(default_factory=QualityExpConfig)
     base_config: Optional[str] = None
