@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 ROOT = Path(__file__).resolve().parents[1]
