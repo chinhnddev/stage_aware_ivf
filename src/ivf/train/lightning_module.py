@@ -180,5 +180,51 @@ class MultiTaskLightningModule(pl.LightningModule):
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False)
 
     def on_validation_epoch_end(self) -> None:
+        if self.trainer and getattr(self.trainer, "sanity_checking", False):
+            return
+
+        metrics = self.trainer.callback_metrics if self.trainer else {}
+
+        def _value(key):
+            if key not in metrics:
+                return None
+            val = metrics[key]
+            if isinstance(val, torch.Tensor):
+                return float(val.detach().cpu())
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        def _append(parts, label, key):
+            value = _value(key)
+            if value is not None:
+                parts.append(f"{label}={value:.4f}")
+
+        parts = [f"[epoch {self.current_epoch + 1}]"]
+        train_loss = _value("train/loss_epoch")
+        if train_loss is None:
+            train_loss = _value("train/loss")
+        if train_loss is not None:
+            parts.append(f"train_loss={train_loss:.4f}")
+
+        _append(parts, "val_loss", "val/loss")
+
+        if self.phase in {"morph", "joint"}:
+            _append(parts, "val_exp_acc", "val/exp_acc")
+            _append(parts, "val_icm_acc", "val/icm_acc")
+            _append(parts, "val_te_acc", "val/te_acc")
+        if self.phase in {"stage", "joint"}:
+            _append(parts, "val_stage_acc", "val/stage_acc")
+            _append(parts, "val_stage_f1", "val/stage_f1")
+        if self.phase == "quality":
+            _append(parts, "val_auroc", "val/quality_auroc")
+            _append(parts, "val_auprc", "val/quality_auprc")
+            _append(parts, "val_f1", "val/quality_f1")
+            _append(parts, "val_acc", "val/quality_acc")
+
+        if len(parts) > 1:
+            get_logger("ivf").info(" ".join(parts))
+
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()

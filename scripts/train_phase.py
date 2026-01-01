@@ -179,12 +179,12 @@ def main():
             logger.warning("CUDA requested but not available; falling back to CPU.")
 
     max_steps = -1 if args.max_steps is None else args.max_steps
-    if args.disable_progress_bar:
-        enable_progress_bar = False
-    elif args.enable_progress_bar:
+    if args.enable_progress_bar:
         enable_progress_bar = True
+    elif args.disable_progress_bar:
+        enable_progress_bar = False
     else:
-        enable_progress_bar = not sys.platform.startswith("win")
+        enable_progress_bar = False
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         max_steps=max_steps,
