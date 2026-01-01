@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=None, help="Optional max training steps.")
     parser.add_argument("--enable_progress_bar", action="store_true", help="Enable progress bar output.")
     parser.add_argument("--disable_progress_bar", action="store_true", help="Disable progress bar output.")
+    parser.add_argument("--live_epoch_line", action="store_true", help="Show live epoch progress on a single line.")
     parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without training.")
     return parser.parse_args()
 
@@ -116,6 +117,7 @@ def main():
         weight_decay=phase_cfg.weight_decay,
         loss_weights=loss_weights,
         freeze_config=freeze_cfg,
+        live_epoch_line=args.live_epoch_line,
     )
 
     prev_ckpt = get_prev_checkpoint(phase, checkpoints_dir, cfg)

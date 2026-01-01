@@ -3,6 +3,8 @@ Lightning module for multi-phase IVF training.
 """
 
 import time
+import sys
+import time
 from typing import Dict, Optional
 
 import pytorch_lightning as pl
@@ -25,6 +27,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         weight_decay: float = 1e-4,
         loss_weights: Optional[Dict[str, float]] = None,
         freeze_config: Optional[Dict] = None,
+        live_epoch_line: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -33,6 +36,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.loss_weights = loss_weights or {"morph": 1.0, "stage": 1.0, "quality": 1.0}
         self.freeze_config = freeze_config or {}
+        self.live_epoch_line = live_epoch_line
+        self._epoch_start_time = None
 
         self._apply_phase_freeze(initial=True)
 
@@ -88,6 +93,31 @@ class MultiTaskLightningModule(pl.LightningModule):
                 ratio = progressive_unfreeze(self.model, epoch=self.current_epoch, schedule=schedule)
                 self.log("train/freeze_ratio", ratio, on_epoch=True, prog_bar=False)
                 get_logger("ivf").info("Stage phase epoch %s: freeze ratio=%s", self.current_epoch, ratio)
+        if self.live_epoch_line:
+            self._epoch_start_time = time.time()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        if not self.live_epoch_line:
+            return
+        if not self.trainer or getattr(self.trainer, "sanity_checking", False):
+            return
+        if getattr(self.trainer, "global_rank", 0) != 0:
+            return
+        num_batches = getattr(self.trainer, "num_training_batches", None)
+        if not isinstance(num_batches, int) or num_batches <= 0:
+            return
+
+        elapsed = (time.time() - self._epoch_start_time) if self._epoch_start_time else 0.0
+        it_per_s = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
+        progress = (batch_idx + 1) / num_batches * 100.0
+
+        sys.stdout.write(
+            f"\r[epoch {self.current_epoch + 1}] progress={progress:5.1f}% it/s={it_per_s:6.2f}"
+        )
+        sys.stdout.flush()
+        if (batch_idx + 1) >= num_batches:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         self._epoch_start_time = time.time()
         self._next_progress_pct = 25.0
 
