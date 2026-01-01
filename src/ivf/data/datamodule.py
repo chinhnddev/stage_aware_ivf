@@ -143,6 +143,10 @@ class IVFDataModule(pl.LightningDataModule):
         include_meta_day: bool = True,
         root_dirs: Optional[Dict[str, str]] = None,
         preflight_samples: int = 5,
+        image_size: int = 256,
+        normalize: bool = False,
+        mean: Optional[list] = None,
+        std: Optional[list] = None,
     ) -> None:
         super().__init__()
         self.phase = phase
@@ -153,6 +157,10 @@ class IVFDataModule(pl.LightningDataModule):
         self.include_meta_day = include_meta_day
         self.root_dirs = root_dirs or {}
         self.preflight_samples = preflight_samples
+        self.image_size = image_size
+        self.normalize = normalize
+        self.mean = mean
+        self.std = std
 
         self.train_dataset = None
         self.val_dataset = None
@@ -190,9 +198,49 @@ class IVFDataModule(pl.LightningDataModule):
                 "Check that image_path entries are POSIX-style and rooted correctly."
             )
 
+    def _preflight_check_shapes(self, dataset, name: str) -> None:
+        if dataset is None:
+            return
+        expected = (3, self.image_size, self.image_size)
+        samples_checked = 0
+        bad_shapes = []
+
+        def _iter_items(ds):
+            if isinstance(ds, BaseImageDataset):
+                for i in range(min(self.preflight_samples, len(ds))):
+                    yield ds[i]
+            elif isinstance(ds, ConcatDataset):
+                for subset in ds.datasets:
+                    yield from _iter_items(subset)
+
+        for item in _iter_items(dataset):
+            tensor = item.get("image")
+            shape = tuple(tensor.shape) if hasattr(tensor, "shape") else None
+            if shape != expected:
+                bad_shapes.append(shape)
+            samples_checked += 1
+            if samples_checked >= self.preflight_samples:
+                break
+
+        if bad_shapes:
+            raise ValueError(
+                f"Unexpected image tensor shapes in {name} dataset (expected {expected}): {bad_shapes[:3]}"
+            )
+
     def setup(self, stage: Optional[str] = None) -> None:
-        train_tf = get_train_transforms(self.train_transform_level)
-        eval_tf = get_eval_transforms()
+        train_tf = get_train_transforms(
+            self.train_transform_level,
+            image_size=self.image_size,
+            normalize=self.normalize,
+            mean=self.mean,
+            std=self.std,
+        )
+        eval_tf = get_eval_transforms(
+            image_size=self.image_size,
+            normalize=self.normalize,
+            mean=self.mean,
+            std=self.std,
+        )
         assert_no_augmentation(eval_tf)
         logger = get_logger("ivf")
         if "hungvuong" in self.splits and self.phase in {"morph", "stage", "joint", "quality"}:
@@ -296,6 +344,8 @@ class IVFDataModule(pl.LightningDataModule):
 
         self._preflight_check_dataset(self.train_dataset, "train")
         self._preflight_check_dataset(self.val_dataset, "val")
+        self._preflight_check_shapes(self.train_dataset, "train")
+        self._preflight_check_shapes(self.val_dataset, "val")
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

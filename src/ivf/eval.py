@@ -42,7 +42,13 @@ def _normalize_day(value) -> Optional[int]:
     return int(match.group(1))
 
 
-def build_hungvuong_quality_dataset(config: Dict) -> BaseImageDataset:
+def build_hungvuong_quality_dataset(
+    config: Dict,
+    image_size: int = 256,
+    normalize: bool = False,
+    mean: Optional[list] = None,
+    std: Optional[list] = None,
+) -> BaseImageDataset:
     df = pd.read_csv(config["csv_path"])
     grade_col = config.get("grade_col") or config.get("label_col")
     quality_col = config.get("quality_col")
@@ -85,7 +91,12 @@ def build_hungvuong_quality_dataset(config: Dict) -> BaseImageDataset:
             }
         )
 
-    eval_tf = get_eval_transforms()
+    eval_tf = get_eval_transforms(
+        image_size=image_size,
+        normalize=normalize,
+        mean=mean,
+        std=std,
+    )
     assert_no_augmentation(eval_tf)
     return BaseImageDataset(records, transform=eval_tf, include_meta_day=True)
 

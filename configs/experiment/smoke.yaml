@@ -23,3 +23,6 @@ training:
 logging:
   tensorboard: false
   csv: false
+
+transforms:
+  image_size: 256

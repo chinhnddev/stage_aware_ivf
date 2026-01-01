@@ -39,10 +39,14 @@ class DataConfig:
 
 @dataclass
 class TransformConfig:
+    image_size: int = 256
     morph: str = "light"
     stage: str = "medium"
     joint: str = "light"
     quality: str = "light"
+    normalize: bool = False
+    mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
 
 
 @dataclass

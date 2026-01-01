@@ -104,7 +104,13 @@ def main():
         return
     load_checkpoint(model, checkpoint_path)
 
-    dataset = build_hungvuong_quality_dataset(hung_cfg)
+    dataset = build_hungvuong_quality_dataset(
+        hung_cfg,
+        image_size=cfg.transforms.image_size,
+        normalize=cfg.transforms.normalize,
+        mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+        std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,

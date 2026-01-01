@@ -16,10 +16,12 @@ data:
   include_meta_day_default: true
 
 transforms:
+  image_size: 256
   morph: light
   stage: medium
   joint: light
   quality: light
+  normalize: false
 
 training:
   lr: 0.001

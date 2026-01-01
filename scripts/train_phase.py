@@ -157,6 +157,10 @@ def main():
         train_transform_level=train_transform_level,
         include_meta_day=data_cfg.include_meta_day_default,
         root_dirs=root_dirs,
+        image_size=transforms_cfg.image_size,
+        normalize=transforms_cfg.normalize,
+        mean=list(transforms_cfg.mean) if transforms_cfg.mean is not None else None,
+        std=list(transforms_cfg.std) if transforms_cfg.std is not None else None,
     )
 
     max_epochs = phase_cfg.epochs.get(phase, 1)
