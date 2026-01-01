@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=None, help="Override num_workers.")
     parser.add_argument("--max_steps", type=int, default=None, help="Optional max training steps.")
     parser.add_argument("--enable_progress_bar", action="store_true", help="Enable progress bar output.")
+    parser.add_argument("--disable_progress_bar", action="store_true", help="Disable progress bar output.")
     parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without training.")
     return parser.parse_args()
 
@@ -178,7 +179,12 @@ def main():
             logger.warning("CUDA requested but not available; falling back to CPU.")
 
     max_steps = -1 if args.max_steps is None else args.max_steps
-    enable_progress_bar = args.enable_progress_bar or not sys.platform.startswith("win")
+    if args.disable_progress_bar:
+        enable_progress_bar = False
+    elif args.enable_progress_bar:
+        enable_progress_bar = True
+    else:
+        enable_progress_bar = not sys.platform.startswith("win")
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         max_steps=max_steps,
