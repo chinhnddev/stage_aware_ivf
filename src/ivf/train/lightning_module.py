@@ -47,6 +47,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         self._epoch_start_time = None
         self._val_pred_counts = None
         self._val_true_counts = None
+        self._val_manual_correct = None
+        self._val_manual_total = None
         self.icm_class_weight = None
         self.te_class_weight = None
         self.icm_num_classes = len(ICM_CLASSES)
@@ -129,6 +131,8 @@ class MultiTaskLightningModule(pl.LightningModule):
                 "icm": torch.zeros(self.icm_num_classes, dtype=torch.long),
                 "te": torch.zeros(self.te_num_classes, dtype=torch.long),
             }
+            self._val_manual_correct = {"icm": 0, "te": 0}
+            self._val_manual_total = {"icm": 0, "te": 0}
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         if not self.live_epoch_line:
@@ -307,21 +311,28 @@ class MultiTaskLightningModule(pl.LightningModule):
         targets = batch["targets"]
 
         if self.phase in {"morph", "joint"}:
-            for key, metric in self.morph_metrics.items():
-                head = key.split("_")[0]
+            if "exp_acc" in self.morph_metrics:
+                t = targets["exp"]
+                mask = t >= 0
+                if mask.any():
+                    preds = outputs["morph"]["exp"].argmax(dim=-1)
+                    self.morph_metrics["exp_acc"].update(preds[mask], t[mask])
+                    self.log("val/exp_acc", self.morph_metrics["exp_acc"], on_epoch=True, prog_bar=False)
+
+            for head, num_classes in (("icm", self.icm_num_classes), ("te", self.te_num_classes)):
                 t = targets[head]
                 mask = targets.get(f"{head}_mask")
                 mask = mask > 0 if mask is not None else t >= 0
-                num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes if head == "te" else None
-                if num_classes is not None:
-                    mask = mask & (t < num_classes)
+                mask = mask & (t < num_classes)
                 if mask.any():
-                    logits = outputs["morph"][head]
-                    if num_classes is not None:
-                        logits = logits[:, :num_classes]
+                    logits = outputs["morph"][head][:, :num_classes]
                     preds = logits.argmax(dim=-1)
-                    metric.update(preds[mask], t[mask])
-                    self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False)
+                    correct = (preds[mask] == t[mask]).sum().item()
+                    total = int(mask.sum().item())
+                    if self._val_manual_correct is not None:
+                        self._val_manual_correct[head] += int(correct)
+                    if self._val_manual_total is not None:
+                        self._val_manual_total[head] += int(total)
 
             if self._val_pred_counts is not None:
                 for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
@@ -391,8 +402,8 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         if self.phase in {"morph", "joint"}:
             _append(parts, "val_exp_acc", "val/exp_acc")
-            _append(parts, "val_icm_acc", "val/icm_acc")
-            _append(parts, "val_te_acc", "val/te_acc")
+            _append(parts, "val_icm_acc", "val_icm_acc")
+            _append(parts, "val_te_acc", "val_te_acc")
         if self.phase in {"stage", "joint"}:
             _append(parts, "val_stage_acc", "val/stage_acc")
             _append(parts, "val_stage_f1", "val/stage_f1")
@@ -420,6 +431,14 @@ class MultiTaskLightningModule(pl.LightningModule):
                 nonzero = int((counts > 0).sum())
                 if nonzero <= 1:
                     logger.warning("Prediction collapse detected for %s head.", head)
+
+            if self._val_manual_correct and self._val_manual_total:
+                for head in ("icm", "te"):
+                    total = self._val_manual_total.get(head, 0)
+                    if total > 0:
+                        acc = self._val_manual_correct.get(head, 0) / total
+                        self.log(f"val_{head}_acc", acc, on_epoch=True, prog_bar=False)
+                        logger.info("Validation %s manual acc: %.4f", head, acc)
 
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()
@@ -469,9 +488,18 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.te_num_classes,
         )
 
-        def _compute_weights(head: str, num_classes: int) -> torch.Tensor:
+        def _compute_weights(head: str, num_classes: int) -> Optional[torch.Tensor]:
             head_counts = counts[head][:num_classes].float()
-            total = head_counts.sum()
+            if num_classes == 2:
+                n_a = head_counts[0].item()
+                n_b = head_counts[1].item()
+                if n_a <= 0 or n_b <= 0:
+                    logger.warning("%s class counts insufficient for weights: %s", head, head_counts.tolist())
+                    return None
+                return torch.tensor([1.0, float(n_a / n_b)])
+            total = head_counts.sum().item()
+            if total <= 0:
+                return None
             weights = torch.ones_like(head_counts)
             for i, c in enumerate(head_counts):
                 if c > 0:
@@ -482,6 +510,10 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self.icm_class_weight = _compute_weights("icm", self.icm_num_classes)
         self.te_class_weight = _compute_weights("te", self.te_num_classes)
+        if self.icm_class_weight is not None:
+            logger.info("ICM class weights: %s", self.icm_class_weight.tolist())
+        if self.te_class_weight is not None:
+            logger.info("TE class weights: %s", self.te_class_weight.tolist())
 
         self.morph_metrics["icm_acc"] = MulticlassAccuracy(num_classes=self.icm_num_classes)
         self.morph_metrics["te_acc"] = MulticlassAccuracy(num_classes=self.te_num_classes)
