@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 import pytorch_lightning as pl
-import torch
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,8 +115,16 @@ def main():
 
     prev_ckpt = get_prev_checkpoint(phase, checkpoints_dir, cfg)
     if prev_ckpt is not None and prev_ckpt.exists():
-        state = torch.load(prev_ckpt, map_location="cpu")
-        lightning_module.load_state_dict(state["state_dict"], strict=False)
+        logger.info("Loading checkpoint weights from %s", prev_ckpt)
+        lightning_module = MultiTaskLightningModule.load_from_checkpoint(
+            checkpoint_path=str(prev_ckpt),
+            model=model,
+            phase=phase,
+            lr=phase_cfg.lr,
+            weight_decay=phase_cfg.weight_decay,
+            loss_weights=loss_weights,
+            freeze_config=freeze_cfg,
+        )
 
     data_cfg = cfg.data
     splits_base_dir = data_cfg.splits_base_dir

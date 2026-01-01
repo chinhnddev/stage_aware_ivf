@@ -27,6 +27,8 @@ from ivf.data.label_schema import map_gardner_to_quality
 from ivf.data.splits import save_splits, split_by_group, summarize_distribution
 from ivf.utils.seed import set_global_seed
 
+MISSINGNESS_THRESHOLD = 0.1
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Prepare data splits.")
@@ -39,51 +41,89 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_group_col(df: pd.DataFrame, cfg: dict) -> str:
+    split_cfg = cfg.get("split", {}) or {}
+    group_col = split_cfg.get("group_col")
+    id_col = cfg.get("id_col")
+
+    if group_col and group_col in df.columns:
+        missing_frac = float(df[group_col].isna().mean())
+        if missing_frac <= MISSINGNESS_THRESHOLD:
+            return group_col
+        print(
+            f"Warning: group_col '{group_col}' missingness {missing_frac:.1%} too high; "
+            f"falling back to id_col '{id_col}'."
+        )
+    elif group_col:
+        print(f"Warning: group_col '{group_col}' missing; falling back to id_col '{id_col}'.")
+
+    fallback_col = id_col if id_col in df.columns else None
+    if fallback_col is None and "id" in df.columns:
+        fallback_col = "id"
+        if id_col and id_col != "id":
+            print(f"Warning: id_col '{id_col}' missing; falling back to 'id'.")
+
+    if fallback_col is None:
+        raise ValueError("Fallback id_col is missing; cannot perform group-wise split.")
+
+    missing_frac = float(df[fallback_col].isna().mean())
+    if missing_frac > MISSINGNESS_THRESHOLD:
+        print(f"Warning: id_col '{fallback_col}' missingness {missing_frac:.1%}.")
+    return fallback_col
+
+
 def make_blastocyst_splits(cfg: dict):
+    day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
+    raw_df = pd.read_csv(cfg["csv_path"])
     records = load_blastocyst_records(
         Path(cfg["root_dir"]),
         Path(cfg["csv_path"]),
         image_col=cfg["image_col"],
         grade_col=cfg["label_col"],
         id_col=cfg["id_col"],
-        day_col=cfg.get("day_col"),
+        day_col=day_col,
     )
+    invalid_count = max(len(raw_df) - len(records), 0)
+    if invalid_count:
+        print(f"Blastocyst invalid Gardner labels: {invalid_count}/{len(raw_df)}")
     df = records_to_dataframe(records)
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
-        group_col=split_cfg.get("group_col"),
+        group_col=_resolve_group_col(df, cfg),
         val_ratio=split_cfg.get("val_ratio", 0.2),
         test_ratio=split_cfg.get("test_ratio", 0.0),
         seed=split_cfg.get("seed", 42),
     )
-    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=cfg.get("day_col")) for k, v in splits.items()}
+    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=day_col) for k, v in splits.items()}
     return splits, summary
 
 
 def make_humanembryo2_splits(cfg: dict):
+    day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
     records = load_humanembryo2_records(
         Path(cfg["root_dir"]),
         Path(cfg["csv_path"]),
         image_col=cfg["image_col"],
         stage_col=cfg["label_col"],
         id_col=cfg["id_col"],
-        day_col=cfg.get("day_col"),
+        day_col=day_col,
     )
     df = humanembryo2_records_to_dataframe(records)
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
-        group_col=split_cfg.get("group_col"),
+        group_col=_resolve_group_col(df, cfg),
         val_ratio=split_cfg.get("val_ratio", 0.2),
         test_ratio=split_cfg.get("test_ratio", 0.0),
         seed=split_cfg.get("seed", 42),
     )
-    summary = {k: summarize_distribution(v, stage_col="stage", quality_col=None, day_col=cfg.get("day_col")) for k, v in splits.items()}
+    summary = {k: summarize_distribution(v, stage_col="stage", quality_col=None, day_col=day_col) for k, v in splits.items()}
     return splits, summary
 
 
 def make_quality_public_splits(cfg: dict):
+    day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
     df = pd.read_csv(cfg["csv_path"])
     df = df.copy()
     df["image_path"] = df[cfg["image_col"]].apply(lambda x: str(Path(cfg["root_dir"]) / str(x)))
@@ -92,24 +132,25 @@ def make_quality_public_splits(cfg: dict):
     if unknown_count:
         print(f"Quality public unknown labels: {unknown_count}/{len(df)}")
     df = df[df["quality"].notna()]
-    if cfg.get("day_col") and cfg["day_col"] in df.columns:
-        df["day"] = df[cfg["day_col"]]
+    if day_col and day_col in df.columns:
+        df["day"] = df[day_col]
     if cfg.get("id_col") and cfg["id_col"] in df.columns:
         df["id"] = df[cfg["id_col"]]
 
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
-        group_col=split_cfg.get("group_col"),
+        group_col=_resolve_group_col(df, cfg),
         val_ratio=split_cfg.get("val_ratio", 0.1),
         test_ratio=split_cfg.get("test_ratio", 0.1),
         seed=split_cfg.get("seed", 42),
     )
-    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=cfg.get("day_col")) for k, v in splits.items()}
+    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=day_col) for k, v in splits.items()}
     return splits, summary
 
 
 def make_hungvuong_splits(cfg: dict):
+    day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
     records = load_hungvuong_records(
         Path(cfg["root_dir"]),
         Path(cfg["csv_path"]),
@@ -118,7 +159,7 @@ def make_hungvuong_splits(cfg: dict):
         stage_col=cfg.get("label_col"),
         grade_col=cfg.get("grade_col") or cfg.get("label_col"),
         quality_col=cfg.get("quality_col"),
-        day_col=cfg.get("day_col"),
+        day_col=day_col,
     )
     df = hungvuong_records_to_dataframe(records)
     if "quality" in df.columns:
@@ -127,7 +168,7 @@ def make_hungvuong_splits(cfg: dict):
             print(f"Hung Vuong unknown quality labels: {unknown_count}/{len(df)}")
     # External test only
     splits = {"test": df}
-    summary = {"test": summarize_distribution(df, stage_col="stage", quality_col="quality", day_col=cfg.get("day_col"))}
+    summary = {"test": summarize_distribution(df, stage_col="stage", quality_col="quality", day_col=day_col)}
     return splits, summary
 
 

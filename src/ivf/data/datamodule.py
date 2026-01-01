@@ -159,6 +159,8 @@ class IVFDataModule(pl.LightningDataModule):
         eval_tf = get_eval_transforms()
         assert_no_augmentation(eval_tf)
         logger = get_logger("ivf")
+        if "hungvuong" in self.splits and self.phase in {"morph", "stage", "joint", "quality"}:
+            raise ValueError("Hung Vuong dataset is external-only and cannot be used in training phases.")
 
         if self.phase == "morph":
             train_df = _load_split_df(self.splits["blastocyst"], "train")
