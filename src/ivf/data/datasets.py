@@ -43,6 +43,8 @@ def normalize_image_path(path_value, root_dir: Optional[str] = None) -> Path:
     if root_dir:
         root = Path(str(root_dir).replace("\\", "/"))
         if not path.is_absolute():
+            if path.parts[: len(root.parts)] == root.parts:
+                return path
             path = root / path
     return path
 

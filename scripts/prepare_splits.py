@@ -86,6 +86,9 @@ def _normalize_split_paths(df: pd.DataFrame, root_dir: str) -> pd.DataFrame:
                 path = path.relative_to(root)
             except ValueError:
                 pass
+        else:
+            if path.parts[: len(root.parts)] == root.parts:
+                path = Path(*path.parts[len(root.parts) :])
         return path.as_posix()
 
     df = df.copy()
