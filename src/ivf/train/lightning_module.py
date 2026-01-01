@@ -35,9 +35,9 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self._apply_phase_freeze(initial=True)
 
-        self.morph_metrics = build_morphology_metrics()
-        self.stage_metrics = build_stage_metrics()
-        self.quality_metrics = build_quality_metrics()
+        self.morph_metrics = nn.ModuleDict(build_morphology_metrics())
+        self.stage_metrics = nn.ModuleDict(build_stage_metrics())
+        self.quality_metrics = nn.ModuleDict(build_quality_metrics())
 
         self.save_hyperparameters(ignore=["model"])
 

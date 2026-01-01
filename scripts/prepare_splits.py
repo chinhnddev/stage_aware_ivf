@@ -88,6 +88,9 @@ def make_quality_public_splits(cfg: dict):
     df = df.copy()
     df["image_path"] = df[cfg["image_col"]].apply(lambda x: str(Path(cfg["root_dir"]) / str(x)))
     df["quality"] = df[cfg["label_col"]].apply(map_gardner_to_quality).apply(lambda x: x.value if x else None)
+    unknown_count = int(df["quality"].isna().sum())
+    if unknown_count:
+        print(f"Quality public unknown labels: {unknown_count}/{len(df)}")
     df = df[df["quality"].notna()]
     if cfg.get("day_col") and cfg["day_col"] in df.columns:
         df["day"] = df[cfg["day_col"]]
@@ -114,9 +117,14 @@ def make_hungvuong_splits(cfg: dict):
         id_col=cfg["id_col"],
         stage_col=cfg.get("label_col"),
         grade_col=cfg.get("grade_col") or cfg.get("label_col"),
+        quality_col=cfg.get("quality_col"),
         day_col=cfg.get("day_col"),
     )
     df = hungvuong_records_to_dataframe(records)
+    if "quality" in df.columns:
+        unknown_count = int(df["quality"].isna().sum())
+        if unknown_count:
+            print(f"Hung Vuong unknown quality labels: {unknown_count}/{len(df)}")
     # External test only
     splits = {"test": df}
     summary = {"test": summarize_distribution(df, stage_col="stage", quality_col="quality", day_col=cfg.get("day_col"))}

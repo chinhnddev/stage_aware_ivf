@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from ivf.config import load_experiment_config
+from ivf.data.datasets import collate_batch
 from ivf.eval import build_hungvuong_quality_dataset, compute_metrics, predict, slice_by_day
 from ivf.models.encoder import ConvNeXtMini
 from ivf.models.multitask import MultiTaskEmbryoNet
@@ -104,7 +105,13 @@ def main():
     load_checkpoint(model, checkpoint_path)
 
     dataset = build_hungvuong_quality_dataset(hung_cfg)
-    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        collate_fn=collate_batch,
+    )
 
     device = torch.device("cpu")
     if str(cfg.device).startswith("cuda"):

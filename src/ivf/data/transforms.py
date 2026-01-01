@@ -11,9 +11,12 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("torchvision is required for transforms. Install torchvision to use data transforms.") from exc
 
 
-def _random_90_rotation():
-    angles = [0, 90, 180, 270]
-    return T.Lambda(lambda img: img.rotate(random.choice(angles)))
+class RandomRotate90:
+    def __init__(self, angles=None):
+        self.angles = angles or [0, 90, 180, 270]
+
+    def __call__(self, img):
+        return img.rotate(random.choice(self.angles))
 
 
 def get_train_transforms(level: Literal["light", "medium"] = "medium"):
@@ -23,7 +26,7 @@ def get_train_transforms(level: Literal["light", "medium"] = "medium"):
     aug = [
         T.RandomHorizontalFlip(),
         T.RandomVerticalFlip(),
-        _random_90_rotation(),
+        RandomRotate90(),
     ]
 
     if level == "light":
@@ -55,7 +58,7 @@ def has_augmentation(transform) -> bool:
             T.RandomHorizontalFlip,
             T.RandomVerticalFlip,
             T.ColorJitter,
-            T.Lambda,
+            RandomRotate90,
         ),
     ):
         return True

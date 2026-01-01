@@ -1,11 +1,11 @@
 dataset_type: humanembryo2
-root_dir: data/HumanEmbryo2.0/images
-csv_path: data/HumanEmbryo2.0/metadata.csv
-image_col: filename
+root_dir: data/HumanEmbryo2.0
+csv_path: data/metadata/humanembryo2.csv
+image_col: image_path
 label_col: stage
 id_col: embryo_id
 day_col: day
-include_meta_day: true
+include_meta_day: false
 split:
   group_col: patient_id
   val_ratio: 0.2

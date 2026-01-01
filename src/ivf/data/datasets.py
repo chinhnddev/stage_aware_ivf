@@ -17,6 +17,7 @@ from PIL import Image
 try:  # pragma: no cover - optional dependency
     import torch
     from torch.utils.data import Dataset
+    from torch.utils.data._utils.collate import default_collate
 except ImportError:  # pragma: no cover
     torch = None
 
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover
 
         def __getitem__(self, index):
             raise ImportError("torch is required for dataset usage.")
+    default_collate = None
 
 try:  # pragma: no cover - optional dependency
     from torchvision import transforms as T
@@ -68,6 +70,12 @@ class BaseImageDataset(Dataset):
         image = self._load_image(image_path)
 
         targets = sample.get("targets", {})
+        if targets is None:
+            targets = {}
+        if isinstance(targets, dict):
+            targets = dict(targets)
+            for key in TARGET_KEYS:
+                targets.setdefault(key, IGNORE_INDEX)
         meta = dict(sample.get("meta", {}))
         if not self.include_meta_day:
             meta.pop("day", None)
@@ -95,3 +103,15 @@ def make_full_target_dict(exp=None, icm=None, te=None, stage=None, quality=None)
         "stage": IGNORE_INDEX if stage is None else stage,
         "quality": IGNORE_INDEX if quality is None else quality,
     }
+
+
+def collate_batch(batch):
+    """
+    Collate batch without attempting to merge heterogeneous meta dicts.
+    """
+    if default_collate is None:
+        raise ImportError("torch is required for batch collation.")
+    images = default_collate([item["image"] for item in batch])
+    targets = default_collate([item["targets"] for item in batch])
+    meta = [item.get("meta", {}) for item in batch]
+    return {"image": images, "targets": targets, "meta": meta}

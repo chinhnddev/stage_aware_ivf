@@ -40,3 +40,21 @@
 - All outputs routed to `outputs/` with checkpoints, logs, and reports separated.
 - Run manifest saved to `outputs/run_manifest.yaml` with config snapshot, seed, dataset path hashes, and checkpoints.
 - Train-only augmentations; val/test/external strictly use eval transforms.
+
+## Developer Commands
+- Install dev tooling: `make dev` (or `pip install -e ".[dev]"`)
+- Tests: `make test`
+- Format: `make fmt`
+- Lint: `make lint`
+- Full check: `make check`
+
+## Synthetic Smoke Test
+- Generate a tiny synthetic dataset and run all phases + external eval:
+  `python scripts/smoke_e2e.py --config configs/experiment/smoke.yaml --fast`
+- Output artifacts are written under `outputs/` and validated by the script.
+
+## Dataset Metadata Status
+- Blastocyst (Kaggle): metadata CSV `data/metadata/blastocyst.csv`; columns `image_path`, `grade`, `gardner`, `exp`, `icm`, `te`, `stage`, `quality`, `day`, `embryo_id`, `patient_id`, `split`, `dataset`; missing fields: `day`, `patient_id`, `stage`, `quality`; readiness for training: YES (splits fall back to image_id when `patient_id` is missing).
+- HumanEmbryo2.0: metadata CSV `data/metadata/humanembryo2.csv`; columns `image_path`, `stage`, `day`, `grade`, `gardner`, `quality`, `embryo_id`, `patient_id`, `split`, `dataset`; missing fields: `day`, `patient_id`, `grade`, `gardner`, `quality`; readiness for training: YES.
+- Quality public: metadata CSV `data/metadata/quality_public.csv`; columns `image_path`, `grade`, `gardner`, `quality`, `exp`, `icm`, `te`, `day`, `embryo_id`, `patient_id`, `split`, `dataset`; missing fields: `day`, `patient_id`; readiness for training: YES (samples with unknown quality mapping are filtered).
+- Hung Vuong: metadata CSV `data/metadata/hungvuong.csv`; columns `image_path`, `quality`, `quality_raw`, `day`, `stage`, `grade`, `gardner`, `embryo_id`, `patient_id`, `split`, `dataset`; missing fields: `stage`, `grade`, `gardner`, `patient_id`; readiness for training: YES (external test only).

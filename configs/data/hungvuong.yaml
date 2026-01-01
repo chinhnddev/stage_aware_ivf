@@ -1,9 +1,10 @@
 dataset_type: hungvuong
-root_dir: data/hv_hospital_day3_day5/images
-csv_path: data/hv_hospital_day3_day5/metadata.csv
-image_col: filename
+root_dir: data/hv_hospital_day3_day5
+csv_path: data/metadata/hungvuong.csv
+image_col: image_path
 label_col: stage
-grade_col: grade
+grade_col: gardner
+quality_col: quality
 id_col: embryo_id
 day_col: day
 include_meta_day: true

@@ -8,7 +8,7 @@ from typing import List, Mapping, MutableMapping, Optional
 import pandas as pd
 
 from ivf.data.datasets import BaseImageDataset
-from ivf.data.label_schema import STAGE_TO_ID, StageLabel, map_gardner_to_quality
+from ivf.data.label_schema import QualityLabel, STAGE_TO_ID, StageLabel, map_gardner_to_quality
 
 
 def _normalize_stage(stage_value) -> Optional[StageLabel]:
@@ -21,6 +21,16 @@ def _normalize_stage(stage_value) -> Optional[StageLabel]:
     return None
 
 
+def _normalize_quality(quality_value) -> Optional[QualityLabel]:
+    if quality_value is None:
+        return None
+    text = str(quality_value).strip().lower()
+    for label in QualityLabel:
+        if label.value == text:
+            return label
+    return None
+
+
 def load_hungvuong_records(
     root_dir: Path,
     csv_path: Path,
@@ -28,6 +38,7 @@ def load_hungvuong_records(
     id_col: str,
     stage_col: Optional[str] = None,
     grade_col: Optional[str] = None,
+    quality_col: Optional[str] = None,
     day_col: Optional[str] = None,
 ) -> List[MutableMapping]:
     df = pd.read_csv(csv_path)
@@ -45,7 +56,14 @@ def load_hungvuong_records(
                 targets["stage"] = STAGE_TO_ID[stage]
                 meta["stage"] = stage.value
 
-        if grade_col and grade_col in df.columns:
+        quality_label = None
+        if quality_col and quality_col in df.columns:
+            quality_label = _normalize_quality(row.get(quality_col))
+            if quality_label:
+                targets["quality"] = quality_label.value
+                meta["quality"] = quality_label.value
+
+        if grade_col and grade_col in df.columns and quality_label is None:
             grade = row.get(grade_col)
             quality = map_gardner_to_quality(grade)
             if quality:
@@ -99,6 +117,7 @@ class HungVuongDataset(BaseImageDataset):
         stage_col: Optional[str] = None,
         grade_col: Optional[str] = None,
         day_col: Optional[str] = None,
+        quality_col: Optional[str] = None,
         split: str = "test",
         mode: str = "test",
     ) -> None:
@@ -117,6 +136,7 @@ class HungVuongDataset(BaseImageDataset):
             id_col=id_col,
             stage_col=stage_col,
             grade_col=grade_col,
+            quality_col=quality_col,
             day_col=day_col,
         )
         super().__init__(records, transform=transform, include_meta_day=include_meta_day)

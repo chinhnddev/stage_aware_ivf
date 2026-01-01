@@ -36,9 +36,9 @@ training:
   freeze:
     stage_start_ratio: 0.8
     stage_schedule:
-      - [0, 0.8]
-      - [5, 0.5]
-      - [10, 0.0]
+      - [0.0, 0.8]
+      - [5.0, 0.5]
+      - [10.0, 0.0]
 
 logging:
   tensorboard: true

@@ -9,7 +9,7 @@ import pandas as pd
 import pytorch_lightning as pl
 from torch.utils.data import ConcatDataset, DataLoader
 
-from ivf.data.datasets import BaseImageDataset, make_full_target_dict
+from ivf.data.datasets import BaseImageDataset, collate_batch, make_full_target_dict
 from ivf.data.label_schema import (
     QUALITY_TO_ID,
     STAGE_TO_ID,
@@ -208,6 +208,7 @@ class IVFDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
+            collate_fn=collate_batch,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -217,6 +218,7 @@ class IVFDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            collate_fn=collate_batch,
         )
 
     def test_dataloader(self) -> Optional[DataLoader]:
@@ -228,4 +230,5 @@ class IVFDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            collate_fn=collate_batch,
         )

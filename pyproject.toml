@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "black>=23.0", "ruff>=0.1"]
+dev = ["pytest", "pytest-cov", "black>=23.0", "ruff>=0.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ivf"]

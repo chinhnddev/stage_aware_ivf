@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
     parser.add_argument("--device", default=None, help="cpu or cuda[:index]")
     parser.add_argument("--num_workers", type=int, default=None, help="Override num_workers.")
+    parser.add_argument("--max_steps", type=int, default=None, help="Optional max training steps.")
     parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without training.")
     return parser.parse_args()
 
@@ -160,7 +161,9 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
+        max_steps=args.max_steps,
         enable_checkpointing=False,
+        enable_progress_bar=False,
         log_every_n_steps=10,
         logger=loggers if loggers else False,
         deterministic=True,

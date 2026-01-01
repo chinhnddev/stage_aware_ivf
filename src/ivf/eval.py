@@ -111,10 +111,18 @@ def predict(model: torch.nn.Module, dataloader: DataLoader, device: torch.device
                 targets = torch.tensor(targets)
 
             meta = batch.get("meta", {})
-            ids = meta.get("id") if isinstance(meta, dict) else None
+            if isinstance(meta, list):
+                ids = [m.get("id") for m in meta]
+                day_vals = [m.get("day") for m in meta]
+            elif isinstance(meta, dict):
+                ids = meta.get("id")
+                day_vals = meta.get("day")
+            else:
+                ids = None
+                day_vals = None
+
             if ids is None:
                 ids = [None] * len(probs)
-            day_vals = meta.get("day") if isinstance(meta, dict) else None
             if day_vals is None:
                 day_vals = [None] * len(probs)
 

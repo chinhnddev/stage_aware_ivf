@@ -1,0 +1,25 @@
+base_config: configs/experiment/base.yaml
+
+seed: 123
+batch_size: 4
+num_workers: 0
+device: cpu
+
+data:
+  blastocyst_config: configs/data/synthetic.yaml
+  humanembryo2_config: configs/data/synthetic.yaml
+  quality_config: configs/data/synthetic.yaml
+  hungvuong_config: configs/data/synthetic.yaml
+  splits_base_dir: outputs/synthetic/splits
+  include_meta_day_default: true
+
+training:
+  epochs:
+    morph: 1
+    stage: 1
+    joint: 1
+    quality: 1
+
+logging:
+  tensorboard: false
+  csv: false
