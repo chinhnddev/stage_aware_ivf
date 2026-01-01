@@ -72,6 +72,27 @@ def _resolve_group_col(df: pd.DataFrame, cfg: dict) -> str:
     return fallback_col
 
 
+def _normalize_split_paths(df: pd.DataFrame, root_dir: str) -> pd.DataFrame:
+    if "image_path" not in df.columns:
+        return df
+    root = Path(root_dir)
+
+    def _normalize(value):
+        if pd.isna(value):
+            return value
+        path = Path(str(value).replace("\\", "/"))
+        if path.is_absolute():
+            try:
+                path = path.relative_to(root)
+            except ValueError:
+                pass
+        return path.as_posix()
+
+    df = df.copy()
+    df["image_path"] = df["image_path"].apply(_normalize)
+    return df
+
+
 def make_blastocyst_splits(cfg: dict):
     day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
     raw_df = pd.read_csv(cfg["csv_path"])
@@ -87,6 +108,7 @@ def make_blastocyst_splits(cfg: dict):
     if invalid_count:
         print(f"Blastocyst invalid Gardner labels: {invalid_count}/{len(raw_df)}")
     df = records_to_dataframe(records)
+    df = _normalize_split_paths(df, cfg["root_dir"])
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
@@ -110,6 +132,7 @@ def make_humanembryo2_splits(cfg: dict):
         day_col=day_col,
     )
     df = humanembryo2_records_to_dataframe(records)
+    df = _normalize_split_paths(df, cfg["root_dir"])
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
@@ -127,6 +150,7 @@ def make_quality_public_splits(cfg: dict):
     df = pd.read_csv(cfg["csv_path"])
     df = df.copy()
     df["image_path"] = df[cfg["image_col"]].apply(lambda x: str(Path(cfg["root_dir"]) / str(x)))
+    df = _normalize_split_paths(df, cfg["root_dir"])
     df["quality"] = df[cfg["label_col"]].apply(map_gardner_to_quality).apply(lambda x: x.value if x else None)
     unknown_count = int(df["quality"].isna().sum())
     if unknown_count:
@@ -162,6 +186,7 @@ def make_hungvuong_splits(cfg: dict):
         day_col=day_col,
     )
     df = hungvuong_records_to_dataframe(records)
+    df = _normalize_split_paths(df, cfg["root_dir"])
     if "quality" in df.columns:
         unknown_count = int(df["quality"].isna().sum())
         if unknown_count:

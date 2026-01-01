@@ -141,6 +141,8 @@ class IVFDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         train_transform_level: str = "light",
         include_meta_day: bool = True,
+        root_dirs: Optional[Dict[str, str]] = None,
+        preflight_samples: int = 5,
     ) -> None:
         super().__init__()
         self.phase = phase
@@ -149,10 +151,44 @@ class IVFDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.train_transform_level = train_transform_level
         self.include_meta_day = include_meta_day
+        self.root_dirs = root_dirs or {}
+        self.preflight_samples = preflight_samples
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+
+    def _root_dir(self, key: str) -> Optional[str]:
+        return self.root_dirs.get(key)
+
+    def _preflight_check_dataset(self, dataset, name: str) -> None:
+        if dataset is None:
+            return
+        samples_checked = 0
+        missing = []
+
+        def _iter_samples(ds):
+            if isinstance(ds, BaseImageDataset):
+                for sample in ds.samples:
+                    yield sample.get("image_path")
+            elif isinstance(ds, ConcatDataset):
+                for subset in ds.datasets:
+                    yield from _iter_samples(subset)
+
+        for path in _iter_samples(dataset):
+            if path is None:
+                continue
+            samples_checked += 1
+            if not Path(path).exists():
+                missing.append(str(path))
+            if samples_checked >= self.preflight_samples:
+                break
+
+        if missing:
+            raise ValueError(
+                f"Missing image files in {name} dataset (showing up to 3): {missing[:3]}. "
+                "Check that image_path entries are POSIX-style and rooted correctly."
+            )
 
     def setup(self, stage: Optional[str] = None) -> None:
         train_tf = get_train_transforms(self.train_transform_level)
@@ -165,14 +201,34 @@ class IVFDataModule(pl.LightningDataModule):
         if self.phase == "morph":
             train_df = _load_split_df(self.splits["blastocyst"], "train")
             val_df = _load_split_df(self.splits["blastocyst"], "val")
-            self.train_dataset = BaseImageDataset(_build_morphology_records(train_df, self.include_meta_day), transform=train_tf, include_meta_day=self.include_meta_day)
-            self.val_dataset = BaseImageDataset(_build_morphology_records(val_df, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day)
+            self.train_dataset = BaseImageDataset(
+                _build_morphology_records(train_df, self.include_meta_day),
+                transform=train_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("blastocyst"),
+            )
+            self.val_dataset = BaseImageDataset(
+                _build_morphology_records(val_df, self.include_meta_day),
+                transform=eval_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("blastocyst"),
+            )
             logger.info("Morphology train size=%s val size=%s", len(self.train_dataset), len(self.val_dataset))
         elif self.phase == "stage":
             train_df = _load_split_df(self.splits["humanembryo2"], "train")
             val_df = _load_split_df(self.splits["humanembryo2"], "val")
-            self.train_dataset = BaseImageDataset(_build_stage_records(train_df, self.include_meta_day), transform=train_tf, include_meta_day=self.include_meta_day)
-            self.val_dataset = BaseImageDataset(_build_stage_records(val_df, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day)
+            self.train_dataset = BaseImageDataset(
+                _build_stage_records(train_df, self.include_meta_day),
+                transform=train_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("humanembryo2"),
+            )
+            self.val_dataset = BaseImageDataset(
+                _build_stage_records(val_df, self.include_meta_day),
+                transform=eval_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("humanembryo2"),
+            )
             logger.info("Stage train size=%s val size=%s", len(self.train_dataset), len(self.val_dataset))
         elif self.phase == "joint":
             blast_train = _load_split_df(self.splits["blastocyst"], "train")
@@ -180,12 +236,32 @@ class IVFDataModule(pl.LightningDataModule):
             human_train = _load_split_df(self.splits["humanembryo2"], "train")
             human_val = _load_split_df(self.splits["humanembryo2"], "val")
             train_sets = [
-                BaseImageDataset(_build_morphology_records(blast_train, self.include_meta_day), transform=train_tf, include_meta_day=self.include_meta_day),
-                BaseImageDataset(_build_stage_records(human_train, self.include_meta_day), transform=train_tf, include_meta_day=self.include_meta_day),
+                BaseImageDataset(
+                    _build_morphology_records(blast_train, self.include_meta_day),
+                    transform=train_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("blastocyst"),
+                ),
+                BaseImageDataset(
+                    _build_stage_records(human_train, self.include_meta_day),
+                    transform=train_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("humanembryo2"),
+                ),
             ]
             val_sets = [
-                BaseImageDataset(_build_morphology_records(blast_val, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day),
-                BaseImageDataset(_build_stage_records(human_val, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day),
+                BaseImageDataset(
+                    _build_morphology_records(blast_val, self.include_meta_day),
+                    transform=eval_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("blastocyst"),
+                ),
+                BaseImageDataset(
+                    _build_stage_records(human_val, self.include_meta_day),
+                    transform=eval_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("humanembryo2"),
+                ),
             ]
             self.train_dataset = ConcatDataset(train_sets)
             self.val_dataset = ConcatDataset(val_sets)
@@ -193,15 +269,33 @@ class IVFDataModule(pl.LightningDataModule):
         elif self.phase == "quality":
             train_df = _load_split_df(self.splits["quality"], "train")
             val_df = _load_split_df(self.splits["quality"], "val")
-            self.train_dataset = BaseImageDataset(_build_quality_records(train_df, self.include_meta_day), transform=train_tf, include_meta_day=self.include_meta_day)
-            self.val_dataset = BaseImageDataset(_build_quality_records(val_df, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day)
+            self.train_dataset = BaseImageDataset(
+                _build_quality_records(train_df, self.include_meta_day),
+                transform=train_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("quality"),
+            )
+            self.val_dataset = BaseImageDataset(
+                _build_quality_records(val_df, self.include_meta_day),
+                transform=eval_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("quality"),
+            )
             test_path = self.splits["quality"] / "test.csv"
             if test_path.exists():
                 test_df = _load_split_df(self.splits["quality"], "test")
-                self.test_dataset = BaseImageDataset(_build_quality_records(test_df, self.include_meta_day), transform=eval_tf, include_meta_day=self.include_meta_day)
+                self.test_dataset = BaseImageDataset(
+                    _build_quality_records(test_df, self.include_meta_day),
+                    transform=eval_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("quality"),
+                )
             logger.info("Quality train size=%s val size=%s test size=%s", len(self.train_dataset), len(self.val_dataset), len(self.test_dataset) if self.test_dataset else 0)
         else:
             raise ValueError(f"Unsupported phase: {self.phase}")
+
+        self._preflight_check_dataset(self.train_dataset, "train")
+        self._preflight_check_dataset(self.val_dataset, "val")
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

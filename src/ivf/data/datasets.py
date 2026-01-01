@@ -35,6 +35,18 @@ except ImportError:  # pragma: no cover
     T = None
 
 
+def normalize_image_path(path_value, root_dir: Optional[str] = None) -> Path:
+    if path_value is None:
+        raise ValueError("image_path is required.")
+    path_str = str(path_value).replace("\\", "/")
+    path = Path(path_str)
+    if root_dir:
+        root = Path(str(root_dir).replace("\\", "/"))
+        if not path.is_absolute():
+            path = root / path
+    return path
+
+
 class BaseImageDataset(Dataset):
     """
     Base dataset that loads images from disk and attaches targets/meta.
@@ -48,8 +60,15 @@ class BaseImageDataset(Dataset):
         samples: Iterable[Mapping],
         transform: Optional[Callable] = None,
         include_meta_day: bool = True,
+        root_dir: Optional[str] = None,
     ) -> None:
-        self.samples: List[Mapping] = list(samples)
+        self.root_dir = root_dir
+        self.samples: List[Mapping] = []
+        for sample in samples:
+            record = dict(sample)
+            if "image_path" in record:
+                record["image_path"] = normalize_image_path(record["image_path"], root_dir=self.root_dir)
+            self.samples.append(record)
         self.transform = transform
         self.include_meta_day = include_meta_day
 
@@ -66,7 +85,9 @@ class BaseImageDataset(Dataset):
 
     def __getitem__(self, index: int) -> MutableMapping:
         sample = self.samples[index]
-        image_path = Path(sample["image_path"])
+        image_path = sample["image_path"]
+        if not isinstance(image_path, Path):
+            image_path = normalize_image_path(image_path, root_dir=self.root_dir)
         image = self._load_image(image_path)
 
         targets = sample.get("targets", {})

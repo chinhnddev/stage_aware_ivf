@@ -100,8 +100,10 @@ def main():
     freeze_cfg = resolve_config_dict(phase_cfg.freeze)
 
     dataset_types = []
-    for path in [cfg.data.blastocyst_config, cfg.data.humanembryo2_config, cfg.data.quality_config]:
-        dataset_cfg = OmegaConf.load(path)
+    blast_cfg = OmegaConf.load(cfg.data.blastocyst_config)
+    human_cfg = OmegaConf.load(cfg.data.humanembryo2_config)
+    quality_cfg = OmegaConf.load(cfg.data.quality_config)
+    for dataset_cfg in [blast_cfg, human_cfg, quality_cfg]:
         dataset_types.append(str(dataset_cfg.get("dataset_type", "")))
     assert_no_hungvuong_training(dataset_types)
 
@@ -137,6 +139,12 @@ def main():
 
     transforms_cfg = cfg.transforms
     train_transform_level = getattr(transforms_cfg, phase)
+    root_dirs = {
+        "blastocyst": blast_cfg.get("root_dir"),
+        "humanembryo2": human_cfg.get("root_dir"),
+        "quality": quality_cfg.get("root_dir"),
+    }
+
     datamodule = IVFDataModule(
         phase=phase,
         splits=splits,
@@ -144,6 +152,7 @@ def main():
         num_workers=cfg.num_workers,
         train_transform_level=train_transform_level,
         include_meta_day=data_cfg.include_meta_day_default,
+        root_dirs=root_dirs,
     )
 
     max_epochs = phase_cfg.epochs.get(phase, 1)
