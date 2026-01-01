@@ -2,6 +2,7 @@
 Lightning module for multi-phase IVF training.
 """
 
+import time
 from typing import Dict, Optional
 
 import pytorch_lightning as pl
@@ -38,6 +39,9 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.morph_metrics = nn.ModuleDict(build_morphology_metrics())
         self.stage_metrics = nn.ModuleDict(build_stage_metrics())
         self.quality_metrics = nn.ModuleDict(build_quality_metrics())
+
+        self._epoch_start_time = None
+        self._next_progress_pct = None
 
         self.save_hyperparameters(ignore=["model"])
 
@@ -84,6 +88,35 @@ class MultiTaskLightningModule(pl.LightningModule):
                 ratio = progressive_unfreeze(self.model, epoch=self.current_epoch, schedule=schedule)
                 self.log("train/freeze_ratio", ratio, on_epoch=True, prog_bar=False)
                 get_logger("ivf").info("Stage phase epoch %s: freeze ratio=%s", self.current_epoch, ratio)
+        self._epoch_start_time = time.time()
+        self._next_progress_pct = 25.0
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        if not self.trainer or getattr(self.trainer, "sanity_checking", False):
+            return
+        num_batches = getattr(self.trainer, "num_training_batches", None)
+        if not isinstance(num_batches, int) or num_batches <= 0:
+            return
+        if self._next_progress_pct is None:
+            return
+
+        progress = (batch_idx + 1) / num_batches * 100.0
+        is_last = (batch_idx + 1) >= num_batches
+        if progress < self._next_progress_pct and not is_last:
+            return
+
+        elapsed = (time.time() - self._epoch_start_time) if self._epoch_start_time else 0.0
+        it_per_s = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
+
+        get_logger("ivf").info(
+            "[epoch %s] progress=%.1f%% it/s=%.2f",
+            self.current_epoch + 1,
+            min(progress, 100.0),
+            it_per_s,
+        )
+
+        while self._next_progress_pct is not None and progress >= self._next_progress_pct:
+            self._next_progress_pct += 25.0
 
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]
