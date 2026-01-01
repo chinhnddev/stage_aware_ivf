@@ -485,3 +485,7 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self.morph_metrics["icm_acc"] = MulticlassAccuracy(num_classes=self.icm_num_classes)
         self.morph_metrics["te_acc"] = MulticlassAccuracy(num_classes=self.te_num_classes)
+        device = getattr(self, "device", None)
+        if device is not None:
+            self.morph_metrics["icm_acc"] = self.morph_metrics["icm_acc"].to(device)
+            self.morph_metrics["te_acc"] = self.morph_metrics["te_acc"].to(device)
