@@ -72,7 +72,12 @@ def _is_missing_token(value) -> bool:
     return text.upper() in {"", "0", "ND", "NA", "N/A"}
 
 
-def _build_morphology_records(df: pd.DataFrame, include_meta_day: bool, context: str) -> list:
+def _build_morphology_records(
+    df: pd.DataFrame,
+    include_meta_day: bool,
+    context: str,
+    drop_missing_icm_te: bool = False,
+) -> list:
     records = []
     has_exp_col = "exp" in df.columns
     has_icm_col = "icm" in df.columns
@@ -88,7 +93,10 @@ def _build_morphology_records(df: pd.DataFrame, include_meta_day: bool, context:
         "invalid_icm": 0,
         "missing_te": 0,
         "invalid_te": 0,
+        "dropped_missing_icm_te": 0,
     }
+    icm_counts = {"A": 0, "B": 0, "C": 0}
+    te_counts = {"A": 0, "B": 0, "C": 0}
     for _, row in df.iterrows():
         stats["total"] += 1
         grade = row.get("grade")
@@ -113,6 +121,13 @@ def _build_morphology_records(df: pd.DataFrame, include_meta_day: bool, context:
         if exp >= 3:
             icm_norm = normalize_gardner_grade(icm_raw) if has_icm_col else (components[1] if components else None)
             te_norm = normalize_gardner_grade(te_raw) if has_te_col else (components[2] if components else None)
+            if drop_missing_icm_te and (icm_norm is None or te_norm is None):
+                stats["dropped_missing_icm_te"] += 1
+                if icm_norm is None:
+                    stats["missing_icm"] += 1
+                if te_norm is None:
+                    stats["missing_te"] += 1
+                continue
             if has_icm_col:
                 if _is_missing_token(icm_raw):
                     stats["missing_icm"] += 1
@@ -163,6 +178,10 @@ def _build_morphology_records(df: pd.DataFrame, include_meta_day: bool, context:
         }
         if include_meta_day and "day" in row:
             meta["day"] = row.get("day")
+        if icm_meta in icm_counts:
+            icm_counts[icm_meta] += 1
+        if te_meta in te_counts:
+            te_counts[te_meta] += 1
         records.append(
             {
                 "image_path": row.get("image_path"),
@@ -171,6 +190,8 @@ def _build_morphology_records(df: pd.DataFrame, include_meta_day: bool, context:
             }
         )
         stats["kept"] += 1
+    stats["icm_label_counts"] = icm_counts
+    stats["te_label_counts"] = te_counts
     get_logger("ivf").info("Blastocyst Gardner parsing stats (%s): %s", context, stats)
     return records
 
@@ -396,13 +417,23 @@ class IVFDataModule(pl.LightningDataModule):
             train_df = _load_split_df(self.splits["blastocyst"], "train")
             val_df = _load_split_df(self.splits["blastocyst"], "val")
             self.train_dataset = BaseImageDataset(
-                _build_morphology_records(train_df, self.include_meta_day, context="morph_train"),
+                _build_morphology_records(
+                    train_df,
+                    self.include_meta_day,
+                    context="morph_train",
+                    drop_missing_icm_te=True,
+                ),
                 transform=train_tf,
                 include_meta_day=self.include_meta_day,
                 root_dir=self._root_dir("blastocyst"),
             )
             self.val_dataset = BaseImageDataset(
-                _build_morphology_records(val_df, self.include_meta_day, context="morph_val"),
+                _build_morphology_records(
+                    val_df,
+                    self.include_meta_day,
+                    context="morph_val",
+                    drop_missing_icm_te=True,
+                ),
                 transform=eval_tf,
                 include_meta_day=self.include_meta_day,
                 root_dir=self._root_dir("blastocyst"),

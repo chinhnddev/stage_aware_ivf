@@ -4,7 +4,6 @@ Lightning module for multi-phase IVF training.
 
 import time
 import sys
-import time
 from typing import Dict, Optional
 
 import pytorch_lightning as pl
@@ -12,6 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ivf.data.label_schema import ICM_CLASSES, TE_CLASSES
 from ivf.metrics import build_morphology_metrics, build_quality_metrics, build_stage_metrics
 from ivf.models.freezing import freeze_encoder, progressive_unfreeze
 from ivf.utils.guardrails import assert_no_day_feature, assert_no_segmentation_inputs
@@ -42,6 +42,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.quality_pos_weight = quality_pos_weight
         self.live_epoch_line = live_epoch_line
         self._epoch_start_time = None
+        self._val_pred_counts = None
 
         if self.morph_loss_reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
@@ -102,6 +103,13 @@ class MultiTaskLightningModule(pl.LightningModule):
                 get_logger("ivf").info("Stage phase epoch %s: freeze ratio=%s", self.current_epoch, ratio)
         if self.live_epoch_line:
             self._epoch_start_time = time.time()
+
+    def on_validation_epoch_start(self) -> None:
+        if self.phase in {"morph", "joint"}:
+            self._val_pred_counts = {
+                "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
+                "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
+            }
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         if not self.live_epoch_line:
@@ -279,6 +287,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                     metric.update(preds[mask], t[mask])
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False)
 
+            if self._val_pred_counts is not None:
+                for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
+                    t = targets[head]
+                    mask = targets.get(f"{head}_mask")
+                    mask = mask > 0 if mask is not None else t >= 0
+                    if mask.any():
+                        mask_cpu = mask.detach().cpu()
+                        preds = outputs["morph"][head].argmax(dim=-1).detach().cpu()
+                        counts = torch.bincount(preds[mask_cpu], minlength=len(classes))
+                        self._val_pred_counts[head] += counts
+
         if self.phase in {"stage", "joint"}:
             t = targets["stage"]
             mask = t >= 0
@@ -344,6 +363,18 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         if len(parts) > 1:
             get_logger("ivf").info(" ".join(parts))
+
+        if self._val_pred_counts and self.phase in {"morph", "joint"}:
+            logger = get_logger("ivf")
+            for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
+                counts = self._val_pred_counts.get(head)
+                if counts is None:
+                    continue
+                count_dict = {cls: int(counts[idx]) for idx, cls in enumerate(classes)}
+                logger.info("Validation %s prediction counts: %s", head, count_dict)
+                nonzero = int((counts > 0).sum())
+                if nonzero <= 1:
+                    logger.warning("Prediction collapse detected for %s head.", head)
 
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()
