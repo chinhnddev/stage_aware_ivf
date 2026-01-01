@@ -22,6 +22,7 @@ from ivf.config import load_experiment_config, resolve_config_dict
 from ivf.data.datamodule import IVFDataModule
 from ivf.models.encoder import ConvNeXtMini
 from ivf.models.multitask import MultiTaskEmbryoNet
+from ivf.train.callbacks import StepProgressLogger
 from ivf.train.lightning_module import MultiTaskLightningModule
 from ivf.utils.guardrails import assert_no_hungvuong_training
 from ivf.utils.logging import configure_logging
@@ -191,17 +192,19 @@ def main():
         enable_progress_bar = False
     else:
         enable_progress_bar = False
+    callbacks = [StepProgressLogger()]
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         max_steps=max_steps,
         enable_checkpointing=False,
         enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
         logger=loggers if loggers else False,
         deterministic=True,
         accelerator=accelerator,
         devices=devices,
         default_root_dir=str(logs_dir),
+        callbacks=callbacks,
     )
 
     trainer.fit(lightning_module, datamodule=datamodule)
