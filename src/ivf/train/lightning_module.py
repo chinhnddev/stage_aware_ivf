@@ -10,7 +10,10 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import ConcatDataset
+from torchmetrics.classification import MulticlassAccuracy
 
+from ivf.data.datasets import BaseImageDataset, IGNORE_INDEX
 from ivf.data.label_schema import ICM_CLASSES, TE_CLASSES
 from ivf.metrics import build_morphology_metrics, build_quality_metrics, build_stage_metrics
 from ivf.models.freezing import freeze_encoder, progressive_unfreeze
@@ -43,6 +46,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.live_epoch_line = live_epoch_line
         self._epoch_start_time = None
         self._val_pred_counts = None
+        self._val_true_counts = None
+        self.icm_class_weight = None
+        self.te_class_weight = None
+        self.icm_num_classes = len(ICM_CLASSES)
+        self.te_num_classes = len(TE_CLASSES)
 
         if self.morph_loss_reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
@@ -104,11 +112,22 @@ class MultiTaskLightningModule(pl.LightningModule):
         if self.live_epoch_line:
             self._epoch_start_time = time.time()
 
+    def on_fit_start(self) -> None:
+        if self.phase not in {"morph", "joint"}:
+            return
+        if self.icm_class_weight is not None or self.te_class_weight is not None:
+            return
+        self._setup_morph_class_weights()
+
     def on_validation_epoch_start(self) -> None:
         if self.phase in {"morph", "joint"}:
             self._val_pred_counts = {
-                "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
-                "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
+                "icm": torch.zeros(self.icm_num_classes, dtype=torch.long),
+                "te": torch.zeros(self.te_num_classes, dtype=torch.long),
+            }
+            self._val_true_counts = {
+                "icm": torch.zeros(self.icm_num_classes, dtype=torch.long),
+                "te": torch.zeros(self.te_num_classes, dtype=torch.long),
             }
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
@@ -177,14 +196,21 @@ class MultiTaskLightningModule(pl.LightningModule):
         targets: torch.Tensor,
         mask: Optional[torch.Tensor],
         weight: float,
+        class_weight: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         if mask is None:
             mask = targets >= 0
         else:
             mask = mask > 0
+        if num_classes is not None:
+            mask = mask & (targets < num_classes)
+            logits = logits[:, :num_classes]
         if not mask.any():
             return None
-        return F.cross_entropy(logits[mask], targets[mask]) * weight
+        if class_weight is not None:
+            class_weight = class_weight.to(logits.device)
+        return F.cross_entropy(logits[mask], targets[mask], weight=class_weight) * weight
 
     def _compute_losses(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
         losses = {}
@@ -201,12 +227,16 @@ class MultiTaskLightningModule(pl.LightningModule):
                 targets["icm"],
                 targets.get("icm_mask"),
                 self.loss_weights.get("morph", 1.0),
+                class_weight=self.icm_class_weight,
+                num_classes=self.icm_num_classes,
             )
             loss_te = self._masked_ce(
                 outputs["morph"]["te"],
                 targets["te"],
                 targets.get("te_mask"),
                 self.loss_weights.get("morph", 1.0),
+                class_weight=self.te_class_weight,
+                num_classes=self.te_num_classes,
             )
             morph_losses = [l for l in [loss_exp, loss_icm, loss_te] if l is not None]
             if morph_losses:
@@ -282,8 +312,14 @@ class MultiTaskLightningModule(pl.LightningModule):
                 t = targets[head]
                 mask = targets.get(f"{head}_mask")
                 mask = mask > 0 if mask is not None else t >= 0
+                num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes if head == "te" else None
+                if num_classes is not None:
+                    mask = mask & (t < num_classes)
                 if mask.any():
-                    preds = outputs["morph"][head].argmax(dim=-1)
+                    logits = outputs["morph"][head]
+                    if num_classes is not None:
+                        logits = logits[:, :num_classes]
+                    preds = logits.argmax(dim=-1)
                     metric.update(preds[mask], t[mask])
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False)
 
@@ -291,12 +327,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                 for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
                     t = targets[head]
                     mask = targets.get(f"{head}_mask")
+                    num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes
                     mask = mask > 0 if mask is not None else t >= 0
+                    mask = mask & (t < num_classes)
                     if mask.any():
                         mask_cpu = mask.detach().cpu()
-                        preds = outputs["morph"][head].argmax(dim=-1).detach().cpu()
-                        counts = torch.bincount(preds[mask_cpu], minlength=len(classes))
+                        logits = outputs["morph"][head].detach().cpu()[:, :num_classes]
+                        preds = logits.argmax(dim=-1)
+                        counts = torch.bincount(preds[mask_cpu], minlength=num_classes)
                         self._val_pred_counts[head] += counts
+                        true_counts = torch.bincount(t.detach().cpu()[mask_cpu], minlength=num_classes)
+                        self._val_true_counts[head] += true_counts
 
         if self.phase in {"stage", "joint"}:
             t = targets["stage"]
@@ -366,15 +407,81 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         if self._val_pred_counts and self.phase in {"morph", "joint"}:
             logger = get_logger("ivf")
-            for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
+            for head, classes in (("icm", ICM_CLASSES[: self.icm_num_classes]), ("te", TE_CLASSES[: self.te_num_classes])):
                 counts = self._val_pred_counts.get(head)
+                true_counts = self._val_true_counts.get(head) if self._val_true_counts else None
                 if counts is None:
                     continue
                 count_dict = {cls: int(counts[idx]) for idx, cls in enumerate(classes)}
                 logger.info("Validation %s prediction counts: %s", head, count_dict)
+                if true_counts is not None:
+                    true_dict = {cls: int(true_counts[idx]) for idx, cls in enumerate(classes)}
+                    logger.info("Validation %s true counts: %s", head, true_dict)
                 nonzero = int((counts > 0).sum())
                 if nonzero <= 1:
                     logger.warning("Prediction collapse detected for %s head.", head)
 
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()
+
+    def _setup_morph_class_weights(self) -> None:
+        if not self.trainer or not hasattr(self.trainer, "datamodule"):
+            return
+        dataset = getattr(self.trainer.datamodule, "train_dataset", None)
+        if dataset is None:
+            return
+
+        counts = {
+            "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
+            "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
+        }
+
+        def _iter_samples(ds):
+            if isinstance(ds, BaseImageDataset):
+                for sample in ds.samples:
+                    yield sample
+            elif isinstance(ds, ConcatDataset):
+                for subset in ds.datasets:
+                    yield from _iter_samples(subset)
+
+        for sample in _iter_samples(dataset):
+            targets = sample.get("targets", {})
+            for head in ("icm", "te"):
+                label = targets.get(head, IGNORE_INDEX)
+                mask = targets.get(f"{head}_mask", 0)
+                if mask and label is not None and label >= 0:
+                    if label < counts[head].numel():
+                        counts[head][int(label)] += 1
+
+        logger = get_logger("ivf")
+        logger.info("Morph train icm counts: %s", {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)})
+        logger.info("Morph train te counts: %s", {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)})
+
+        self.icm_num_classes = 2 if counts["icm"][2] == 0 else 3
+        self.te_num_classes = 2 if counts["te"][2] == 0 else 3
+        if self.icm_num_classes == 2:
+            logger.warning("ICM class C missing; using 2-class (A/B) loss and metrics.")
+        if self.te_num_classes == 2:
+            logger.warning("TE class C missing; using 2-class (A/B) loss and metrics.")
+        logger.info(
+            "Morph heads for loss/metrics: icm_num_classes=%s te_num_classes=%s.",
+            self.icm_num_classes,
+            self.te_num_classes,
+        )
+
+        def _compute_weights(head: str, num_classes: int) -> torch.Tensor:
+            head_counts = counts[head][:num_classes].float()
+            total = head_counts.sum()
+            weights = torch.ones_like(head_counts)
+            for i, c in enumerate(head_counts):
+                if c > 0:
+                    weights[i] = total / (num_classes * c)
+                else:
+                    weights[i] = 0.0
+            return weights
+
+        self.icm_class_weight = _compute_weights("icm", self.icm_num_classes)
+        self.te_class_weight = _compute_weights("te", self.te_num_classes)
+
+        self.morph_metrics["icm_acc"] = MulticlassAccuracy(num_classes=self.icm_num_classes)
+        self.morph_metrics["te_acc"] = MulticlassAccuracy(num_classes=self.te_num_classes)
