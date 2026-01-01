@@ -167,9 +167,10 @@ def main():
         else:
             logger.warning("CUDA requested but not available; falling back to CPU.")
 
+    max_steps = -1 if args.max_steps is None else args.max_steps
     trainer = pl.Trainer(
         max_epochs=max_epochs,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         enable_checkpointing=False,
         enable_progress_bar=False,
         log_every_n_steps=10,
