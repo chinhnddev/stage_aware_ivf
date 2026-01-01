@@ -3,27 +3,27 @@ Training callbacks for lightweight progress logging.
 """
 
 from pathlib import Path
+import sys
 import time
 from typing import Optional
 
 import pytorch_lightning as pl
 
-from ivf.utils.logging import get_logger
-
 
 class StepProgressLogger(pl.Callback):
     """
-    Log a lightweight progress line every N steps to show training is active.
+    Print a single-line progress update during training.
     """
 
-    def __init__(self) -> None:
-        self._last_time: Optional[float] = None
-        self._last_step: Optional[int] = None
+    def __init__(self, single_line: bool = True, update_every_n_steps: Optional[int] = None) -> None:
+        self.single_line = single_line
+        self.update_every_n_steps = update_every_n_steps
+        self._epoch_start_time: Optional[float] = None
+        self._last_len: int = 0
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        now = time.time()
-        self._last_time = now
-        self._last_step = trainer.global_step
+        self._epoch_start_time = time.time()
+        self._last_len = 0
 
 
 class BestMetricCheckpoint(pl.Callback):
@@ -103,21 +103,15 @@ class BestMetricCheckpoint(pl.Callback):
         if getattr(trainer, "global_rank", 0) != 0:
             return
 
-        interval = max(1, int(getattr(trainer, "log_every_n_steps", 50)))
-        is_last = (batch_idx + 1) >= getattr(trainer, "num_training_batches", 0)
+        interval = self.update_every_n_steps or max(1, int(getattr(trainer, "log_every_n_steps", 50)))
+        num_batches = getattr(trainer, "num_training_batches", 0)
+        is_last = (batch_idx + 1) >= num_batches
         if not is_last and (batch_idx + 1) % interval != 0:
             return
 
-        now = time.time()
-        last_time = self._last_time or now
-        last_step = self._last_step if self._last_step is not None else trainer.global_step
-        steps_since = max(1, trainer.global_step - last_step)
-        elapsed = max(1e-6, now - last_time)
-        step_time = elapsed / steps_since
-
-        num_batches = getattr(trainer, "num_training_batches", 0)
-        remaining = max(0, num_batches - (batch_idx + 1))
-        eta = remaining * step_time
+        elapsed = max(1e-6, time.time() - (self._epoch_start_time or time.time()))
+        it_per_s = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
+        progress = (batch_idx + 1) / max(1, num_batches) * 100.0
 
         lr = None
         if trainer.optimizers:
@@ -138,16 +132,30 @@ class BestMetricCheckpoint(pl.Callback):
                 break
 
         message = (
-            f"[epoch {trainer.current_epoch + 1}] step {trainer.global_step} "
-            f"batch {batch_idx + 1}/{num_batches} "
-            f"lr={lr:.6f} " if lr is not None else
-            f"[epoch {trainer.current_epoch + 1}] step {trainer.global_step} "
-            f"batch {batch_idx + 1}/{num_batches} "
+            f"[epoch {trainer.current_epoch + 1}/{trainer.max_epochs}] "
+            f"{batch_idx + 1}/{num_batches} ({progress:5.1f}%) "
+            f"it/s={it_per_s:.2f}"
         )
+        if lr is not None:
+            message += f" lr={lr:.6f}"
         if loss is not None:
-            message += f"loss={loss:.4f} "
-        message += f"step_time={step_time:.3f}s eta={eta:.1f}s"
-        get_logger("ivf").info(message)
+            message += f" loss={loss:.4f}"
 
-        self._last_time = now
-        self._last_step = trainer.global_step
+        if self.single_line:
+            padding = " " * max(0, self._last_len - len(message))
+            sys.stdout.write("\r" + message + padding)
+            sys.stdout.flush()
+            self._last_len = len(message)
+            if is_last:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._last_len = 0
+        else:
+            sys.stdout.write(message + "\n")
+            sys.stdout.flush()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.single_line and self._last_len:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_len = 0

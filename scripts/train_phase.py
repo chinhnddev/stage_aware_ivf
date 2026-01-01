@@ -523,13 +523,10 @@ def main():
             logger.warning("CUDA requested but not available; falling back to CPU.")
 
     max_steps = -1 if args.max_steps is None else args.max_steps
-    if args.enable_progress_bar:
-        enable_progress_bar = True
-    elif args.disable_progress_bar:
-        enable_progress_bar = False
-    else:
-        enable_progress_bar = False
-    callbacks = [StepProgressLogger()]
+    enable_progress_bar = False
+    callbacks = []
+    if not args.disable_progress_bar:
+        callbacks.append(StepProgressLogger(single_line=True))
     best_ckpt_path = None
     if phase == "quality":
         best_ckpt_path = checkpoints_dir / "phase4_quality.ckpt"
