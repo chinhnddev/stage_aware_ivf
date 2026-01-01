@@ -1,0 +1,12 @@
+dataset_type: humanembryo2
+root_dir: data/HumanEmbryo2.0/images
+csv_path: data/HumanEmbryo2.0/metadata.csv
+image_col: filename
+label_col: stage
+id_col: embryo_id
+day_col: day
+include_meta_day: true
+split:
+  group_col: patient_id
+  val_ratio: 0.2
+  test_ratio: 0.0

@@ -1,0 +1,4 @@
+in_channels: 3
+dims: [32, 64, 128]
+feature_dim: 256
+weights_path: null

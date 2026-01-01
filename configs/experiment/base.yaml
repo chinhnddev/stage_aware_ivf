@@ -1,0 +1,50 @@
+seed: 42
+batch_size: 16
+num_workers: 4
+device: cuda
+
+model:
+  encoder_config: configs/model/encoder.yaml
+  heads_config: configs/model/heads.yaml
+
+data:
+  blastocyst_config: configs/data/blastocyst.yaml
+  humanembryo2_config: configs/data/humanembryo2.yaml
+  quality_config: configs/data/quality_public.yaml
+  hungvuong_config: configs/data/hungvuong.yaml
+  splits_base_dir: data/processed/splits
+  include_meta_day_default: true
+
+transforms:
+  morph: light
+  stage: medium
+  joint: light
+  quality: light
+
+training:
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs:
+    morph: 20
+    stage: 15
+    joint: 10
+    quality: 10
+  loss_weights:
+    morph: 1.0
+    stage: 1.0
+    quality: 1.0
+  freeze:
+    stage_start_ratio: 0.8
+    stage_schedule:
+      - [0, 0.8]
+      - [5, 0.5]
+      - [10, 0.0]
+
+logging:
+  tensorboard: true
+  csv: false
+
+outputs:
+  checkpoints_dir: outputs/checkpoints
+  logs_dir: outputs/logs
+  reports_dir: outputs/reports

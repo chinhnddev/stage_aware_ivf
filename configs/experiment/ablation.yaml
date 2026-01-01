@@ -1,0 +1,10 @@
+base_config: configs/experiment/base.yaml
+
+model:
+  heads:
+    quality_mode: film
+
+training:
+  epochs:
+    stage: 8
+    quality: 8

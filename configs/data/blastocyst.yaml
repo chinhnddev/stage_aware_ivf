@@ -1,0 +1,12 @@
+dataset_type: blastocyst
+root_dir: data/blastocyst_Dataset/images
+csv_path: data/blastocyst_Dataset/metadata.csv
+image_col: filename
+label_col: grade
+id_col: embryo_id
+day_col: day
+include_meta_day: true
+split:
+  group_col: patient_id
+  val_ratio: 0.2
+  test_ratio: 0.0

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ivf"
+version = "0.1.0"
+description = "Stage-aware morphology-informed learning for IVF embryo quality"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "IVF Research" }
+]
+dependencies = [
+  "pandas>=1.5",
+  "pyyaml>=6.0",
+  "Pillow>=9.0",
+  "torch>=1.13",
+  "torchvision>=0.14",
+  "pytorch-lightning>=2.0",
+  "torchmetrics>=1.0",
+  "omegaconf>=2.3",
+  "tensorboard>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black>=23.0", "ruff>=0.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ivf"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

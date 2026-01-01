@@ -1,0 +1,10 @@
+dataset_type: hungvuong
+root_dir: data/hv_hospital_day3_day5/images
+csv_path: data/hv_hospital_day3_day5/metadata.csv
+image_col: filename
+label_col: stage
+grade_col: grade
+id_col: embryo_id
+day_col: day
+include_meta_day: true
+# No train/val splits; this dataset is external test only.

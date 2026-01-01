@@ -1,0 +1,158 @@
+"""
+Prepare data splits with leakage prevention.
+
+Usage:
+    python scripts/prepare_splits.py --config configs/data/blastocyst.yaml
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+from omegaconf import OmegaConf
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "src"))
+
+from ivf.data.adapters import (
+    humanembryo2_records_to_dataframe,
+    hungvuong_records_to_dataframe,
+    load_blastocyst_records,
+    load_humanembryo2_records,
+    load_hungvuong_records,
+    records_to_dataframe,
+)
+from ivf.data.label_schema import map_gardner_to_quality
+from ivf.data.splits import save_splits, split_by_group, summarize_distribution
+from ivf.utils.seed import set_global_seed
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Prepare data splits.")
+    parser.add_argument("--config", required=True, help="Path to YAML config.")
+    parser.add_argument("--output-dir", default="data/processed/splits", help="Base output directory for splits.")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for split generation.")
+    parser.add_argument("--device", default=None, help="Unused; for interface consistency.")
+    parser.add_argument("--num_workers", type=int, default=None, help="Unused; for interface consistency.")
+    parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without writing splits.")
+    return parser.parse_args()
+
+
+def make_blastocyst_splits(cfg: dict):
+    records = load_blastocyst_records(
+        Path(cfg["root_dir"]),
+        Path(cfg["csv_path"]),
+        image_col=cfg["image_col"],
+        grade_col=cfg["label_col"],
+        id_col=cfg["id_col"],
+        day_col=cfg.get("day_col"),
+    )
+    df = records_to_dataframe(records)
+    split_cfg = cfg.get("split", {})
+    splits = split_by_group(
+        df,
+        group_col=split_cfg.get("group_col"),
+        val_ratio=split_cfg.get("val_ratio", 0.2),
+        test_ratio=split_cfg.get("test_ratio", 0.0),
+        seed=split_cfg.get("seed", 42),
+    )
+    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=cfg.get("day_col")) for k, v in splits.items()}
+    return splits, summary
+
+
+def make_humanembryo2_splits(cfg: dict):
+    records = load_humanembryo2_records(
+        Path(cfg["root_dir"]),
+        Path(cfg["csv_path"]),
+        image_col=cfg["image_col"],
+        stage_col=cfg["label_col"],
+        id_col=cfg["id_col"],
+        day_col=cfg.get("day_col"),
+    )
+    df = humanembryo2_records_to_dataframe(records)
+    split_cfg = cfg.get("split", {})
+    splits = split_by_group(
+        df,
+        group_col=split_cfg.get("group_col"),
+        val_ratio=split_cfg.get("val_ratio", 0.2),
+        test_ratio=split_cfg.get("test_ratio", 0.0),
+        seed=split_cfg.get("seed", 42),
+    )
+    summary = {k: summarize_distribution(v, stage_col="stage", quality_col=None, day_col=cfg.get("day_col")) for k, v in splits.items()}
+    return splits, summary
+
+
+def make_quality_public_splits(cfg: dict):
+    df = pd.read_csv(cfg["csv_path"])
+    df = df.copy()
+    df["image_path"] = df[cfg["image_col"]].apply(lambda x: str(Path(cfg["root_dir"]) / str(x)))
+    df["quality"] = df[cfg["label_col"]].apply(map_gardner_to_quality).apply(lambda x: x.value if x else None)
+    df = df[df["quality"].notna()]
+    if cfg.get("day_col") and cfg["day_col"] in df.columns:
+        df["day"] = df[cfg["day_col"]]
+    if cfg.get("id_col") and cfg["id_col"] in df.columns:
+        df["id"] = df[cfg["id_col"]]
+
+    split_cfg = cfg.get("split", {})
+    splits = split_by_group(
+        df,
+        group_col=split_cfg.get("group_col"),
+        val_ratio=split_cfg.get("val_ratio", 0.1),
+        test_ratio=split_cfg.get("test_ratio", 0.1),
+        seed=split_cfg.get("seed", 42),
+    )
+    summary = {k: summarize_distribution(v, stage_col=None, quality_col="quality", day_col=cfg.get("day_col")) for k, v in splits.items()}
+    return splits, summary
+
+
+def make_hungvuong_splits(cfg: dict):
+    records = load_hungvuong_records(
+        Path(cfg["root_dir"]),
+        Path(cfg["csv_path"]),
+        image_col=cfg["image_col"],
+        id_col=cfg["id_col"],
+        stage_col=cfg.get("label_col"),
+        grade_col=cfg.get("grade_col") or cfg.get("label_col"),
+        day_col=cfg.get("day_col"),
+    )
+    df = hungvuong_records_to_dataframe(records)
+    # External test only
+    splits = {"test": df}
+    summary = {"test": summarize_distribution(df, stage_col="stage", quality_col="quality", day_col=cfg.get("day_col"))}
+    return splits, summary
+
+
+def main():
+    args = parse_args()
+    cfg = OmegaConf.load(args.config)
+    dataset_type = cfg.get("dataset_type")
+    output_dir = Path(args.output_dir) / Path(args.config).stem
+    set_global_seed(args.seed, deterministic=True)
+    if args.dry_run:
+        print(f"Dry run: validated config for {dataset_type}")
+        return
+
+    if "split" in cfg and cfg["split"] is not None:
+        cfg["split"]["seed"] = args.seed
+
+    if dataset_type == "blastocyst":
+        splits, summary = make_blastocyst_splits(cfg)
+    elif dataset_type == "humanembryo2":
+        splits, summary = make_humanembryo2_splits(cfg)
+    elif dataset_type == "quality_public":
+        splits, summary = make_quality_public_splits(cfg)
+    elif dataset_type == "hungvuong":
+        splits, summary = make_hungvuong_splits(cfg)
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+
+    save_splits(splits, output_dir=Path(output_dir))
+
+    print(f"Saved splits to {output_dir}")
+    for split_name, dist in summary.items():
+        print(f"[{split_name}] distribution: {dist}")
+
+
+if __name__ == "__main__":
+    main()
