@@ -233,22 +233,25 @@ def _ensure_quality_splits(quality_cfg, split_entry, seed: int, logger):
         }
 
     missing = [name for name, path in split_paths.items() if name != "test" and not path.exists()]
-    if not missing and all(path.exists() for path in split_paths.values() if path is not None):
-        group_col = split_cfg.get("group_col")
-        if group_col and group_col in pd.read_csv(split_paths["train"]).columns:
-            train_df = pd.read_csv(split_paths["train"])
-            val_df = pd.read_csv(split_paths["val"])
-            test_df = pd.read_csv(split_paths["test"]) if split_paths["test"].exists() else None
-            splits = [train_df, val_df] + ([test_df] if test_df is not None else [])
-            _assert_no_group_overlap([s for s in splits if s is not None], group_col)
-        return split_paths
     if missing:
         logger.warning("Quality split files missing (%s); regenerating splits.", ", ".join(missing))
+    else:
+        logger.info("Regenerating quality splits from %s for EXP-4.", quality_cfg.csv_path)
 
     df = pd.read_csv(quality_cfg.csv_path)
+    total_before = len(df)
     df = _derive_quality_labels(df, logger)
     if df.empty:
         raise ValueError("No samples remain after deriving quality labels.")
+    total_after = len(df)
+    counts = df["quality_label"].value_counts(dropna=False).to_dict()
+    logger.info(
+        "Quality derive summary: before=%s after=%s good=%s poor=%s",
+        total_before,
+        total_after,
+        counts.get(1, 0),
+        counts.get(0, 0),
+    )
 
     group_col = split_cfg.get("group_col")
     if group_col and group_col in df.columns and df[group_col].notna().any():

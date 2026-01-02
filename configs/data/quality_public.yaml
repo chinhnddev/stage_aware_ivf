@@ -1,6 +1,6 @@
 dataset_type: quality_public
 root_dir: data/blastocyst_Dataset
-csv_path: data/metadata/quality_public.csv
+csv_path: data/metadata/blastocyst.csv
 
 image_col: image_path
 label_col: quality_label      # CHANGED: dùng nhãn good/poor đã derive
