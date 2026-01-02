@@ -56,16 +56,58 @@ def build_model(cfg) -> MultiTaskEmbryoNet:
     )
 
 
-def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path) -> None:
+def _load_threshold(reports_dir: Path, logger) -> float | None:
+    threshold_path = reports_dir / "exp04_best_threshold.json"
+    if not threshold_path.exists():
+        return None
+    try:
+        with threshold_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        threshold = payload.get("threshold")
+        if threshold is None:
+            return None
+        threshold = float(threshold)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logger.warning("Failed to read threshold from %s", threshold_path)
+        return None
+    logger.info("Using tuned threshold %.4f from %s", threshold, threshold_path)
+    return threshold
+
+
+def _f1_at_threshold(prob_good, y_true, threshold: float) -> float | None:
+    if not prob_good:
+        return None
+    tp = fp = fn = 0
+    for prob, label in zip(prob_good, y_true):
+        pred = 1 if prob >= threshold else 0
+        if pred == 1 and label == 1:
+            tp += 1
+        elif pred == 1 and label == 0:
+            fp += 1
+        elif pred == 0 and label == 1:
+            fn += 1
+    denom = 2 * tp + fp + fn
+    if denom == 0:
+        return 0.0
+    return float(2 * tp / denom)
+
+
+def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=None) -> None:
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     state_dict = ckpt.get("state_dict", ckpt)
     if any(k.startswith("model.") for k in state_dict.keys()):
         state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"Warning: missing keys when loading checkpoint: {missing}")
+        if logger:
+            logger.warning("Missing keys when loading checkpoint: %s", missing)
+        else:
+            print(f"Warning: missing keys when loading checkpoint: {missing}")
     if unexpected:
-        print(f"Warning: unexpected keys when loading checkpoint: {unexpected}")
+        if logger:
+            logger.warning("Unexpected keys when loading checkpoint: %s", unexpected)
+        else:
+            print(f"Warning: unexpected keys when loading checkpoint: {unexpected}")
 
 
 def main():
@@ -102,7 +144,9 @@ def main():
     if args.dry_run:
         logger.info("Dry run: checkpoint found at %s", checkpoint_path)
         return
-    load_checkpoint(model, checkpoint_path)
+    logger.info("Loading checkpoint weights from %s", checkpoint_path)
+    load_checkpoint(model, checkpoint_path, logger=logger)
+    logger.info("Checkpoint weights loaded.")
 
     dataset = build_hungvuong_quality_dataset(
         hung_cfg,
@@ -128,18 +172,29 @@ def main():
     model.to(device)
 
     preds = predict(model, dataloader, device)
-    overall = compute_metrics(preds["prob_good"], preds["y_true"])
-    day3 = compute_metrics(*slice_by_day(preds, 3))
-    day5 = compute_metrics(*slice_by_day(preds, 5))
 
     output_dir = ensure_outputs_dir(args.output_dir or cfg.outputs.reports_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    threshold = _load_threshold(output_dir, logger)
+
+    overall = compute_metrics(preds["prob_good"], preds["y_true"])
+    day3_probs, day3_true = slice_by_day(preds, 3)
+    day5_probs, day5_true = slice_by_day(preds, 5)
+    day3 = compute_metrics(day3_probs, day3_true)
+    day5 = compute_metrics(day5_probs, day5_true)
+    if threshold is not None:
+        overall["f1"] = _f1_at_threshold(preds["prob_good"], preds["y_true"], threshold)
+        day3["f1"] = _f1_at_threshold(day3_probs, day3_true, threshold)
+        day5["f1"] = _f1_at_threshold(day5_probs, day5_true, threshold)
 
     metrics = {
         "overall": overall,
         "day3": day3,
         "day5": day5,
     }
+    if threshold is not None:
+        metrics["threshold"] = threshold
     metrics_path = output_dir / "external_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
