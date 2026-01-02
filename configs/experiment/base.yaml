@@ -18,7 +18,7 @@ data:
 transforms:
   image_size: 256
   morph: light
-  stage: medium
+  stage: light
   joint: light
   quality: light
   normalize: true
