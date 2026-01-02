@@ -49,9 +49,15 @@ def _normalize_day(value) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        day = int(value)
-        return day
+        try:
+            if isinstance(value, float) and value != value:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
     text = str(value).lower()
+    if text in {"nan", "none", ""}:
+        return None
     match = re.search(r"(\d+)", text)
     if not match:
         return None
