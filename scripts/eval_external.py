@@ -37,6 +37,11 @@ def parse_args():
     parser.add_argument("--device", default=None, help="cpu or cuda[:index]")
     parser.add_argument("--num_workers", type=int, default=None, help="Override num_workers.")
     parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without evaluation.")
+    parser.add_argument(
+        "--tune_day5_threshold",
+        action="store_true",
+        help="Tune threshold on external day5 subset (analysis-only).",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +96,21 @@ def _f1_at_threshold(prob_good, y_true, threshold: float) -> float | None:
     if denom == 0:
         return 0.0
     return float(2 * tp / denom)
+
+
+def _tune_threshold(prob_good, y_true) -> tuple[float | None, float | None]:
+    if not prob_good:
+        return None, None
+    best_thresh = None
+    best_f1 = -1.0
+    for thresh in [i / 100 for i in range(5, 96)]:
+        f1 = _f1_at_threshold(prob_good, y_true, thresh)
+        if f1 is None:
+            continue
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = float(thresh)
+    return best_thresh, (None if best_f1 < 0 else float(best_f1))
 
 
 def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=None) -> None:
@@ -196,6 +216,16 @@ def main():
     }
     if threshold is not None:
         metrics["threshold"] = threshold
+
+    if args.tune_day5_threshold:
+        tuned_thresh, tuned_f1 = _tune_threshold(day5_probs, day5_true)
+        if tuned_thresh is not None:
+            metrics["day5_tuned"] = {"threshold": tuned_thresh, "f1": tuned_f1}
+            logger.info("Day5 tuned threshold=%.4f f1=%.4f", tuned_thresh, tuned_f1 or 0.0)
+            tuned_path = output_dir / "external_day5_threshold.json"
+            with tuned_path.open("w", encoding="utf-8") as f:
+                json.dump(metrics["day5_tuned"], f, indent=2)
+            logger.info("Saved day5 tuned threshold to %s", tuned_path)
     metrics_path = output_dir / "external_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
