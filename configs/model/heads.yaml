@@ -1,1 +1,2 @@
 quality_mode: concat
+quality_conditioning: stage

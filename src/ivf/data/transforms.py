@@ -39,13 +39,13 @@ def _base_transforms(
 
 
 def get_train_transforms(
-    level: Literal["light", "medium"] = "medium",
+    level: Literal["light", "medium", "strong"] = "medium",
     image_size: int = 256,
     normalize: bool = False,
     mean: Optional[Iterable[float]] = None,
     std: Optional[Iterable[float]] = None,
 ):
-    if level not in {"light", "medium"}:
+    if level not in {"light", "medium", "strong"}:
         raise ValueError(f"Unsupported transform level: {level}")
 
     aug = [
@@ -56,8 +56,10 @@ def get_train_transforms(
 
     if level == "light":
         aug.append(T.ColorJitter(brightness=0.05, contrast=0.05))
-    else:
+    elif level == "medium":
         aug.append(T.ColorJitter(brightness=0.15, contrast=0.15))
+    else:
+        aug.append(T.ColorJitter(brightness=0.3, contrast=0.3))
 
     ops = _base_transforms(image_size, normalize, mean, std)
     return T.Compose(ops[:1] + aug + ops[1:])

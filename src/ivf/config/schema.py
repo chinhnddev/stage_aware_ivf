@@ -17,6 +17,7 @@ class EncoderConfig:
 @dataclass
 class HeadsConfig:
     quality_mode: str = "concat"
+    quality_conditioning: str = "stage"
 
 
 @dataclass

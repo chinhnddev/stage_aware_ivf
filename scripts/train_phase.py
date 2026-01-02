@@ -356,6 +356,7 @@ def build_model(cfg) -> MultiTaskEmbryoNet:
         encoder=encoder,
         feature_dim=encoder_cfg.feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
+        quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "stage"),
     )
 
 
