@@ -526,7 +526,7 @@ def main():
     enable_progress_bar = False
     callbacks = []
     if not args.disable_progress_bar:
-        callbacks.append(StepProgressLogger(single_line=True, update_every_n_steps=1))
+        callbacks.append(StepProgressLogger(single_line=True, update_every_n_steps=10))
     best_ckpt_path = None
     if phase == "quality":
         best_ckpt_path = checkpoints_dir / "phase4_quality.ckpt"
@@ -544,7 +544,7 @@ def main():
         max_steps=max_steps,
         enable_checkpointing=False,
         enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=50,
+        log_every_n_steps=10,
         logger=loggers if loggers else False,
         deterministic=True,
         accelerator=accelerator,
