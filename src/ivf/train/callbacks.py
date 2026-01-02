@@ -9,6 +9,8 @@ from typing import Optional
 
 import pytorch_lightning as pl
 
+from ivf.utils.logging import get_logger
+
 
 class StepProgressLogger(pl.Callback):
     """
@@ -35,6 +37,70 @@ class StepProgressLogger(pl.Callback):
         if self.show_epoch_header:
             sys.stdout.write(f"Epoch {trainer.current_epoch + 1}/{trainer.max_epochs}\n")
             sys.stdout.flush()
+
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        if getattr(trainer, "sanity_checking", False):
+            return
+        if getattr(trainer, "global_rank", 0) != 0:
+            return
+
+        interval = self.update_every_n_steps or max(1, int(getattr(trainer, "log_every_n_steps", 50)))
+        num_batches = getattr(trainer, "num_training_batches", 0)
+        is_last = (batch_idx + 1) >= num_batches
+        if not is_last and (batch_idx + 1) % interval != 0:
+            return
+
+        elapsed = max(1e-6, time.time() - (self._epoch_start_time or time.time()))
+        it_per_s = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
+        metrics = trainer.callback_metrics
+        loss = None
+        for key in ("train/loss_step", "train/loss"):
+            if key in metrics:
+                value = metrics[key]
+                try:
+                    loss = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
+                except (TypeError, ValueError):
+                    loss = None
+                break
+
+        filled = int(self.bar_width * (batch_idx + 1) / max(1, num_batches))
+        bar = "=" * max(0, filled - 1)
+        bar += ">" if filled > 0 else ""
+        bar += "." * max(0, self.bar_width - filled)
+        ms_per_step = (1000.0 / it_per_s) if it_per_s > 0 else 0.0
+
+        message = (
+            f"{batch_idx + 1}/{num_batches} [{bar}] "
+            f"- {elapsed:.0f}s {ms_per_step:.0f}ms/step"
+        )
+        if loss is not None:
+            message += f" - loss: {loss:.4f}"
+
+        if self.single_line:
+            padding = " " * max(0, self._last_len - len(message))
+            sys.stdout.write("\r" + message + padding)
+            sys.stdout.flush()
+            self._last_len = len(message)
+            if is_last:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._last_len = 0
+        else:
+            sys.stdout.write(message + "\n")
+            sys.stdout.flush()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.single_line and self._last_len:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_len = 0
 
 
 class BestMetricCheckpoint(pl.Callback):
@@ -100,76 +166,3 @@ class BestMetricCheckpoint(pl.Callback):
                 metric_name,
                 score,
             )
-
-    def on_train_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs,
-        batch,
-        batch_idx: int,
-    ) -> None:
-        if getattr(trainer, "sanity_checking", False):
-            return
-        if getattr(trainer, "global_rank", 0) != 0:
-            return
-
-        interval = self.update_every_n_steps or max(1, int(getattr(trainer, "log_every_n_steps", 50)))
-        num_batches = getattr(trainer, "num_training_batches", 0)
-        is_last = (batch_idx + 1) >= num_batches
-        if not is_last and (batch_idx + 1) % interval != 0:
-            return
-
-        elapsed = max(1e-6, time.time() - (self._epoch_start_time or time.time()))
-        it_per_s = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
-        progress = (batch_idx + 1) / max(1, num_batches) * 100.0
-
-        lr = None
-        if trainer.optimizers:
-            try:
-                lr = trainer.optimizers[0].param_groups[0].get("lr")
-            except (IndexError, AttributeError, KeyError, TypeError):
-                lr = None
-
-        metrics = trainer.callback_metrics
-        loss = None
-        for key in ("train/loss_step", "train/loss"):
-            if key in metrics:
-                value = metrics[key]
-                try:
-                    loss = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
-                except (TypeError, ValueError):
-                    loss = None
-                break
-
-        filled = int(self.bar_width * (batch_idx + 1) / max(1, num_batches))
-        bar = "=" * max(0, filled - 1)
-        bar += ">" if filled > 0 else ""
-        bar += "." * max(0, self.bar_width - filled)
-        ms_per_step = (1000.0 / it_per_s) if it_per_s > 0 else 0.0
-
-        message = (
-            f"{batch_idx + 1}/{num_batches} [{bar}] "
-            f"- {elapsed:.0f}s {ms_per_step:.0f}ms/step"
-        )
-        if loss is not None:
-            message += f" - loss: {loss:.4f}"
-
-        if self.single_line:
-            padding = " " * max(0, self._last_len - len(message))
-            sys.stdout.write("\r" + message + padding)
-            sys.stdout.flush()
-            self._last_len = len(message)
-            if is_last:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                self._last_len = 0
-        else:
-            sys.stdout.write(message + "\n")
-            sys.stdout.flush()
-
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if self.single_line and self._last_len:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self._last_len = 0
