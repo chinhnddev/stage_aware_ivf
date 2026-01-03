@@ -1,3 +1,4 @@
+import logging
 import pytest
 
 from ivf.utils.guardrails import assert_no_hungvuong_training
@@ -9,8 +10,12 @@ def test_hungvuong_training_blocked():
         assert_no_hungvuong_training(["blastocyst", "hungvuong"])
 
 
-def test_datamodule_blocks_hungvuong_in_training():
-    splits = {"hungvuong": "data/processed/splits/hungvuong"}
+def test_datamodule_warns_hungvuong_in_training(tmp_path, caplog):
+    split_dir = tmp_path / "blastocyst"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    (split_dir / "train.csv").write_text("image_path,grade\n", encoding="utf-8")
+    (split_dir / "val.csv").write_text("image_path,grade\n", encoding="utf-8")
+    splits = {"blastocyst": split_dir, "hungvuong": tmp_path / "hungvuong"}
     datamodule = IVFDataModule(
         phase="morph",
         splits=splits,
@@ -19,5 +24,6 @@ def test_datamodule_blocks_hungvuong_in_training():
         train_transform_level="light",
         include_meta_day=False,
     )
-    with pytest.raises(ValueError):
+    with caplog.at_level(logging.WARNING):
         datamodule.setup()
+    assert "Hung Vuong" in caplog.text

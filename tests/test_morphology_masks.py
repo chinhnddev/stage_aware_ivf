@@ -10,6 +10,7 @@ from ivf.data.label_schema import (
     TE_CLASSES,
     gardner_to_morphology_targets,
 )
+from ivf.data.datamodule import _log_morphology_train_stats
 from ivf.train.lightning_module import MultiTaskLightningModule
 
 
@@ -62,3 +63,14 @@ def test_missing_icm_te_are_masked():
 def test_range_label_is_rejected():
     with pytest.raises(ValueError):
         gardner_to_morphology_targets("3-4AB")
+
+
+def test_morph_label_index_guardrail():
+    records = [
+        {
+            "targets": {"icm": 2, "icm_mask": 1, "te": 0, "te_mask": 1},
+            "meta": {"icm": "A", "te": "A"},
+        }
+    ]
+    with pytest.raises(ValueError, match="targets out of range"):
+        _log_morphology_train_stats(records, context="morph_train")

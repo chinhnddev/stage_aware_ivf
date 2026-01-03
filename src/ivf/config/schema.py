@@ -17,7 +17,7 @@ class EncoderConfig:
 @dataclass
 class HeadsConfig:
     quality_mode: str = "concat"
-    quality_conditioning: str = "stage"
+    quality_conditioning: str = "morph+stage"
 
 
 @dataclass
@@ -57,12 +57,28 @@ class FreezeConfig:
 
 
 @dataclass
+class MorphTrainingConfig:
+    use_class_weights: bool = False
+    class_weight_mode: str = "inverse_freq"
+    balance_icm_te: bool = False
+    labeled_mix_ratio: float = 0.5
+
+
+@dataclass
+class LossConfig:
+    use_class_weights: bool = False
+
+
+@dataclass
 class TrainingConfig:
     lr: float = 0.001
     weight_decay: float = 0.0001
     epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10})
     loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0})
     morph_loss_reduction: str = "mean"
+    morph_labeled_oversample_ratio: float = 0.5
+    loss: LossConfig = field(default_factory=LossConfig)
+    morph: MorphTrainingConfig = field(default_factory=MorphTrainingConfig)
     joint_sampling: str = "balanced"
     quality_sampling: str = "proportional"
     require_prev_ckpt: bool = True

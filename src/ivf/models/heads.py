@@ -49,6 +49,62 @@ class StageHead(nn.Module):
         return self.net(features)
 
 
+class QualityHead(nn.Module):
+    """
+    Quality head without conditioning.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features)
+
+
+class ConditionedQualityHead(nn.Module):
+    """
+    Quality head conditioned on a generic context vector.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        cond_dim: int,
+        hidden_dim: int = 128,
+        mode: Literal["concat", "film"] = "concat",
+    ) -> None:
+        super().__init__()
+        if cond_dim <= 0:
+            raise ValueError("cond_dim must be > 0 for conditioned quality head.")
+        self.mode = mode
+        if mode == "concat":
+            self.net = nn.Sequential(
+                nn.Linear(in_dim + cond_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        elif mode == "film":
+            self.cond_embed = nn.Linear(cond_dim, in_dim * 2)
+            self.out = nn.Linear(in_dim, 2)
+        else:
+            raise ValueError(f"Unsupported quality head mode: {mode}")
+
+    def forward(self, features: torch.Tensor, cond_vec: torch.Tensor) -> torch.Tensor:
+        if self.mode == "concat":
+            x = torch.cat([features, cond_vec], dim=-1)
+            return self.net(x)
+
+        gamma_beta = self.cond_embed(cond_vec)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+        gated = (1 + gamma) * features + beta
+        return self.out(F.gelu(gated))
+
+
 class StageConditionedQualityHead(nn.Module):
     """
     Quality head conditioned on stage probabilities.
@@ -62,18 +118,12 @@ class StageConditionedQualityHead(nn.Module):
         mode: Literal["concat", "film"] = "concat",
     ) -> None:
         super().__init__()
-        self.mode = mode
-        if mode == "concat":
-            self.net = nn.Sequential(
-                nn.Linear(in_dim + stage_classes, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, 2),
-            )
-        elif mode == "film":
-            self.stage_embed = nn.Linear(stage_classes, in_dim * 2)
-            self.out = nn.Linear(in_dim, 2)
-        else:
-            raise ValueError(f"Unsupported quality head mode: {mode}")
+        self._head = ConditionedQualityHead(
+            in_dim=in_dim,
+            cond_dim=stage_classes,
+            hidden_dim=hidden_dim,
+            mode=mode,
+        )
 
     def forward(
         self,
@@ -86,12 +136,4 @@ class StageConditionedQualityHead(nn.Module):
                 raise ValueError("Stage probabilities or logits required for conditioned quality head.")
             stage_probs = F.softmax(stage_logits, dim=-1)
 
-        if self.mode == "concat":
-            x = torch.cat([features, stage_probs], dim=-1)
-            return self.net(x)
-
-        # FiLM-style modulation
-        gamma_beta = self.stage_embed(stage_probs)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        gated = (1 + gamma) * features + beta
-        return self.out(F.gelu(gated))
+        return self._head(features, stage_probs)

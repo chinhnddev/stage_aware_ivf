@@ -8,4 +8,6 @@ quality_col: quality
 id_col: embryo_id
 day_col: day
 include_meta_day: true
+# External evaluation must not use Gardner/grade-derived labels.
+allow_grade_labels: false
 # No train/val splits; this dataset is external test only.

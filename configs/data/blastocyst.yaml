@@ -10,3 +10,5 @@ split:
   group_col: patient_id
   val_ratio: 0.2
   test_ratio: 0.0
+  stratified: true
+  min_val_per_class: 3

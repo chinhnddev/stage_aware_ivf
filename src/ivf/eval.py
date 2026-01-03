@@ -14,35 +14,10 @@ from torch.utils.data import DataLoader
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryF1Score
 
 from ivf.data.datasets import BaseImageDataset, make_full_target_dict
-from ivf.data.label_schema import QUALITY_TO_ID, QualityLabel, map_gardner_to_quality
+from ivf.data.label_schema import QUALITY_TO_ID, QualityLabel
 from ivf.data.transforms import assert_no_augmentation, get_eval_transforms
+from ivf.eval_label_sources import resolve_quality_label, update_label_source_counts
 from ivf.utils.guardrails import assert_no_day_feature, assert_no_segmentation_inputs
-
-
-def _normalize_quality(value) -> Optional[QualityLabel]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and value in {0, 1}:
-        return QualityLabel.GOOD if int(value) == 1 else QualityLabel.POOR
-    text = str(value).strip().lower()
-    if text in {"0", "1"}:
-        return QualityLabel.GOOD if text == "1" else QualityLabel.POOR
-    for label in QualityLabel:
-        if label.value == text:
-            return label
-    return None
-
-
-def _quality_from_path(path_value: Optional[str]) -> Optional[QualityLabel]:
-    if path_value is None:
-        return None
-    path = Path(str(path_value).replace("\\", "/"))
-    parent = path.parent.name
-    if parent == "1":
-        return QualityLabel.GOOD
-    if parent == "0":
-        return QualityLabel.POOR
-    return None
 
 
 def _normalize_day(value) -> Optional[int]:
@@ -72,38 +47,57 @@ def build_hungvuong_quality_dataset(
     std: Optional[list] = None,
 ) -> BaseImageDataset:
     df = pd.read_csv(config["csv_path"])
-    grade_col = config.get("grade_col") or config.get("label_col")
+    return build_quality_dataset_from_df(
+        df,
+        config=config,
+        image_size=image_size,
+        normalize=normalize,
+        mean=mean,
+        std=std,
+    )
+
+
+def build_quality_dataset_from_df(
+    df: pd.DataFrame,
+    config: Dict,
+    image_size: int = 256,
+    normalize: bool = False,
+    mean: Optional[list] = None,
+    std: Optional[list] = None,
+) -> BaseImageDataset:
     quality_col = config.get("quality_col")
     day_col = config.get("day_col")
     image_col = config["image_col"]
     id_col = config["id_col"]
     root_dir = Path(config["root_dir"])
+    allow_grade = bool(config.get("allow_grade_labels", False))
+    grade_col = config.get("grade_col") or config.get("label_col")
 
     records = []
+    source_counts: Dict[str, int] = {}
     for _, row in df.iterrows():
-        quality_label = None
-        if quality_col and quality_col in df.columns:
-            quality_label = _normalize_quality(row.get(quality_col))
-        if quality_label is None and grade_col and grade_col in df.columns:
-            quality_label = map_gardner_to_quality(row.get(grade_col))
-        if quality_label is None:
-            quality_label = _quality_from_path(row.get(image_col))
-
-        if quality_label is None:
+        label_value, source = resolve_quality_label(
+            row,
+            image_col=image_col,
+            quality_col=quality_col,
+            grade_col=grade_col,
+            allow_grade=allow_grade,
+        )
+        update_label_source_counts(source_counts, source)
+        if label_value is None:
             continue
 
         image_id = row.get(id_col)
         if pd.isna(image_id):
             image_id = row.get(image_col)
 
-        targets = make_full_target_dict(quality=QUALITY_TO_ID[quality_label])
+        targets = make_full_target_dict(quality=label_value)
         meta = {
             "id": image_id,
             "dataset": "hungvuong",
-            "quality": quality_label.value,
+            "quality": QualityLabel.GOOD.value if label_value == 1 else QualityLabel.POOR.value,
+            "label_source": source,
         }
-        if grade_col and grade_col in df.columns:
-            meta["grade"] = row.get(grade_col)
         if day_col and day_col in df.columns:
             meta["day"] = row.get(day_col)
 
@@ -122,15 +116,28 @@ def build_hungvuong_quality_dataset(
         std=std,
     )
     assert_no_augmentation(eval_tf)
+    if source_counts:
+        source_summary = ", ".join(f"{k}={v}" for k, v in sorted(source_counts.items()))
+        print(f"External label sources: {source_summary}")
     return BaseImageDataset(records, transform=eval_tf, include_meta_day=True, root_dir=str(root_dir))
 
 
-def predict(model: torch.nn.Module, dataloader: DataLoader, device: torch.device) -> Dict[str, List]:
+def predict(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    return_morph: bool = False,
+    return_stage: bool = False,
+) -> Dict[str, List]:
     model.eval()
     prob_good: List[float] = []
     y_true: List[int] = []
     days: List[Optional[int]] = []
     image_ids: List[str] = []
+    exp_preds: List[int] = []
+    icm_preds: List[int] = []
+    te_preds: List[int] = []
+    stage_preds: List[int] = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -139,6 +146,12 @@ def predict(model: torch.nn.Module, dataloader: DataLoader, device: torch.device
             images = batch["image"].to(device)
             outputs = model(images)
             probs = torch.softmax(outputs["quality"], dim=-1)[:, 1].detach().cpu()
+            if return_morph:
+                exp_pred = torch.argmax(outputs["morph"]["exp"], dim=-1).detach().cpu()
+                icm_pred = torch.argmax(outputs["morph"]["icm"], dim=-1).detach().cpu()
+                te_pred = torch.argmax(outputs["morph"]["te"], dim=-1).detach().cpu()
+            if return_stage:
+                stage_pred = torch.argmax(outputs["stage"], dim=-1).detach().cpu()
             targets = batch["targets"]["quality"]
             if isinstance(targets, torch.Tensor):
                 targets = targets.detach().cpu()
@@ -169,18 +182,31 @@ def predict(model: torch.nn.Module, dataloader: DataLoader, device: torch.device
                 y_true.append(int(targets[i]))
                 image_ids.append(str(ids[i]))
                 days.append(_normalize_day(day_vals[i]))
+                if return_morph:
+                    exp_preds.append(int(exp_pred[i]))
+                    icm_preds.append(int(icm_pred[i]))
+                    te_preds.append(int(te_pred[i]))
+                if return_stage:
+                    stage_preds.append(int(stage_pred[i]))
 
-    return {
+    result = {
         "prob_good": prob_good,
         "y_true": y_true,
         "day": days,
         "image_id": image_ids,
     }
+    if return_morph:
+        result["morph_pred"] = {"exp": exp_preds, "icm": icm_preds, "te": te_preds}
+    if return_stage:
+        result["stage_pred"] = stage_preds
+    return result
 
 
 def compute_metrics(prob_good: Iterable[float], y_true: Iterable[int]) -> Dict[str, Optional[float]]:
-    prob_tensor = torch.tensor(list(prob_good), dtype=torch.float32)
-    y_tensor = torch.tensor(list(y_true), dtype=torch.int64)
+    prob_list = list(prob_good)
+    y_list = list(y_true)
+    prob_tensor = torch.tensor(prob_list, dtype=torch.float32)
+    y_tensor = torch.tensor(y_list, dtype=torch.int64)
     if prob_tensor.numel() == 0:
         return {"auroc": None, "auprc": None, "f1": None}
 

@@ -1,0 +1,4 @@
+base_config: configs/experiment/base.yaml
+
+data:
+  hungvuong_config: configs/data/dataset_test1.yaml

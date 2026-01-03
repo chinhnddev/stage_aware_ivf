@@ -45,33 +45,51 @@ def main():
 
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     rows = []
-    for split in ["overall", "day3", "day5"]:
-        row = metrics.get(split, {})
-        rows.append(
-            {
-                "split": split,
-                "auroc": row.get("auroc"),
-                "auprc": row.get("auprc"),
-                "f1": row.get("f1"),
-            }
-        )
+    if "zero_shot" in metrics:
+        for mode_key in ["zero_shot", "calibrated", "analysis_oracle", "analysis_morph_rule"]:
+            block = metrics.get(mode_key)
+            if not block:
+                continue
+            for split in ["overall", "day3", "day5"]:
+                row = block.get(split, {})
+                rows.append(
+                    {
+                        "mode": mode_key,
+                        "split": split,
+                        "auroc": row.get("auroc"),
+                        "auprc": row.get("auprc"),
+                        "f1": row.get("f1"),
+                    }
+                )
+    else:
+        for split in ["overall", "day3", "day5"]:
+            row = metrics.get(split, {})
+            rows.append(
+                {
+                    "mode": "legacy",
+                    "split": split,
+                    "auroc": row.get("auroc"),
+                    "auprc": row.get("auprc"),
+                    "f1": row.get("f1"),
+                }
+            )
 
     output_csv = reports_dir / "summary_table.csv"
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["split", "auroc", "auprc", "f1"])
+        writer = csv.DictWriter(f, fieldnames=["mode", "split", "auroc", "auprc", "f1"])
         writer.writeheader()
         writer.writerows(rows)
 
     latex_lines = [
-        r"\begin{tabular}{lccc}",
+        r"\begin{tabular}{llccc}",
         r"\toprule",
-        r"Split & AUROC & AUPRC & F1 \\",
+        r"Mode & Split & AUROC & AUPRC & F1 \\",
         r"\midrule",
     ]
     for row in rows:
         latex_lines.append(
-            f"{row['split']} & {row['auroc']} & {row['auprc']} & {row['f1']} \\\\"
+            f"{row['mode']} & {row['split']} & {row['auroc']} & {row['auprc']} & {row['f1']} \\\\"
         )
     latex_lines += [r"\bottomrule", r"\end{tabular}"]
     output_tex = reports_dir / "summary_table.tex"

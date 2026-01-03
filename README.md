@@ -11,7 +11,7 @@
 ## Architecture
 - Shared encoder (`ConvNeXtMini`) -> pooled feature vector.
 - Heads: Morphology (EXP/ICM/TE), Stage (cleavage/morula/blastocyst), Quality (good/poor).
-- Stage-conditioned quality: quality head receives features + stage probabilities (concat by default; FiLM optional) so quality is informed by predicted stage. No day metadata is ever accepted by the model forward.
+- Morphology-conditioned quality: quality head receives features + morphology + stage probabilities (concat by default; FiLM optional) so quality is informed by predicted morphology and stage. No day metadata is ever accepted by the model forward.
 - Outputs: `{"features": f, "morph": {"exp":..., "icm":..., "te":...}, "stage":..., "quality":...}` with losses defined in `src/ivf/losses.py`.
 - Encoder initializes randomly by default; optional `weights_path` can load external weights, but no ImageNet-pretrained claim is made.
 
@@ -19,13 +19,15 @@
 - Phase 1 (morphology): learn EXP/ICM/TE on blastocysts with light augmentations; establishes morphology features.
 - Phase 2 (stage): learn stage with medium augmentations; encoder progressively unfrozen for stage awareness.
 - Phase 3 (joint): light joint adaptation on blastocyst + HumanEmbryo2.0; balanced morphology/stage losses.
-- Phase 4 (quality): train only the stage-conditioned quality head; encoder, morphology, and stage heads frozen.
+- Phase 4 (quality): train only the morphology+stage-conditioned quality head; encoder, morphology, and stage heads frozen.
 - Augmentations are applied ONLY in train loaders; val/test/external always use eval transforms.
+- Pipeline overview: see `docs/PIPELINE.md`.
 
 ## Main Experiment
 - Train sources: blastocyst + HumanEmbryo2.0 through phases 1–4; final evaluation uses `phase4_quality.ckpt`.
 - External test policy: Hung Vuong hospital data is external-only and never used in training.
 - Metrics on external: AUROC, AUPRC, F1; reported overall plus day-3 and day-5 slices.
+- External evaluation modes: zero-shot (source threshold from EXP-4 val) and calibrated (threshold/temperature tuned on HV-val only).
 - Day is used only for analysis/reporting; it is never passed to the model.
 - Run end-to-end: `python scripts/run_main_experiment.py`
 

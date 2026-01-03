@@ -1,9 +1,9 @@
 """
-Prepare metadata CSV for dataset_test (external evaluation only).
+Prepare metadata CSV for dataset_test1 (external evaluation only).
 
 Folder mapping:
-  1 -> blastocyst (good)
-  2 -> non-blastocyst (poor)
+  1,2 -> poor
+  3,4,5 -> good
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ def _relative_posix(path: Path, root_dir: Path) -> str:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Prepare metadata for dataset_test.")
-    parser.add_argument("--root_dir", default="data/dataset_test", help="Root directory of dataset_test.")
-    parser.add_argument("--output", default="data/metadata/dataset_test.csv", help="Output CSV path.")
+    parser = argparse.ArgumentParser(description="Prepare metadata for dataset_test1.")
+    parser.add_argument("--root_dir", default="data/dataset_test1", help="Root directory of dataset_test1.")
+    parser.add_argument("--output", default="data/metadata/dataset_test1.csv", help="Output CSV path.")
     parser.add_argument("--day", type=int, default=5, help="Day value for all samples.")
     return parser.parse_args()
 
@@ -45,7 +45,10 @@ def main() -> None:
     records = []
     mapping = {
         "1": (0, "poor"),
-        "2": (1, "good"),
+        "2": (0, "poor"),
+        "3": (1, "good"),
+        "4": (1, "good"),
+        "5": (1, "good"),
     }
     counts = {"good": 0, "poor": 0}
 
@@ -61,14 +64,14 @@ def main() -> None:
                     "quality": quality,
                     "day": args.day,
                     "embryo_id": path.stem,
-                    "dataset": "dataset_test",
+                    "dataset": "dataset_test1",
                 }
             )
             counts[quality] += 1
 
     df = pd.DataFrame(records)
     if df.empty:
-        raise ValueError("No images found in dataset_test.")
+        raise ValueError("No images found in dataset_test1.")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

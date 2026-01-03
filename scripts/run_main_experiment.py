@@ -54,6 +54,7 @@ def main():
 
     logs_dir = ensure_outputs_dir(cfg.outputs.logs_dir)
     logger = configure_logging(logs_dir / "train.log")
+    logger.info("Seed=%s", cfg.seed)
     skip_train = str_to_bool(args.skip_train_if_exists)
 
     checkpoints_dir = ensure_outputs_dir(cfg.outputs.checkpoints_dir)
@@ -127,9 +128,18 @@ def main():
         if report_path.exists():
             report = json.loads(report_path.read_text(encoding="utf-8"))
             print("External metrics summary:")
-            for key in ["overall", "day3", "day5"]:
-                metrics = report.get(key, {})
-                print(f"{key}: AUROC={metrics.get('auroc')} AUPRC={metrics.get('auprc')} F1={metrics.get('f1')}")
+            if "zero_shot" in report:
+                for mode in ["zero_shot", "calibrated"]:
+                    block = report.get(mode)
+                    if not block:
+                        continue
+                    for key in ["overall", "day3", "day5"]:
+                        metrics = block.get(key, {})
+                        print(f"{mode}/{key}: AUROC={metrics.get('auroc')} AUPRC={metrics.get('auprc')} F1={metrics.get('f1')}")
+            else:
+                for key in ["overall", "day3", "day5"]:
+                    metrics = report.get(key, {})
+                    print(f"{key}: AUROC={metrics.get('auroc')} AUPRC={metrics.get('auprc')} F1={metrics.get('f1')}")
         else:
             print("External metrics report not found.")
 
