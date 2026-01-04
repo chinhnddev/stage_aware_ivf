@@ -26,6 +26,7 @@ from ivf.data.label_schema import (
     normalize_gardner_exp,
     normalize_gardner_grade,
     parse_gardner_components,
+    q_proxy_from_components,
 )
 from ivf.data.transforms import assert_no_augmentation, get_eval_transforms, get_train_transforms
 from ivf.utils.logging import get_logger
@@ -363,6 +364,96 @@ def _build_morphology_records(
     return records
 
 
+def _build_q_records(
+    df: pd.DataFrame,
+    include_meta_day: bool,
+    context: str,
+    q_weights: Optional[Dict[str, float]] = None,
+) -> list:
+    records = []
+    stats = {"total": 0, "kept": 0, "dropped_missing_gt": 0}
+    for _, row in df.iterrows():
+        stats["total"] += 1
+        grade = row.get("grade")
+        if is_gardner_range_label(grade):
+            stats["dropped_missing_gt"] += 1
+            continue
+        exp_raw = row.get("exp")
+        icm_raw = row.get("icm")
+        te_raw = row.get("te")
+        components = parse_gardner_components(grade)
+        exp = normalize_gardner_exp(exp_raw)
+        icm = normalize_gardner_grade(icm_raw)
+        te = normalize_gardner_grade(te_raw)
+        if components is not None:
+            if exp is None:
+                exp = components[0]
+            if icm is None:
+                icm = components[1]
+            if te is None:
+                te = components[2]
+        if exp is None or icm is None or te is None or exp < 3:
+            stats["dropped_missing_gt"] += 1
+            continue
+
+        q_proxy = q_proxy_from_components(exp, icm, te, weights=q_weights)
+        if q_proxy is None:
+            stats["dropped_missing_gt"] += 1
+            continue
+
+        try:
+            morph_targets = gardner_to_morphology_targets(
+                grade,
+                exp_value=exp,
+                icm_value=icm,
+                te_value=te,
+            )
+        except ValueError:
+            stats["dropped_missing_gt"] += 1
+            continue
+
+        quality_label = None
+        if "quality_label" in df.columns and pd.notna(row.get("quality_label")):
+            quality_label = _normalize_quality(row.get("quality_label"))
+        if quality_label is None and "quality" in df.columns:
+            quality_label = _normalize_quality(row.get("quality"))
+
+        targets = make_full_target_dict(
+            exp=morph_targets.get("exp"),
+            icm=morph_targets.get("icm"),
+            te=morph_targets.get("te"),
+            exp_mask=morph_targets.get("exp_mask"),
+            icm_mask=morph_targets.get("icm_mask"),
+            te_mask=morph_targets.get("te_mask"),
+            quality=QUALITY_TO_ID[quality_label] if quality_label is not None else None,
+            q=q_proxy,
+            q_mask=1,
+        )
+        meta = {
+            "id": row.get("id"),
+            "dataset": row.get("dataset", "blastocyst"),
+            "grade": grade,
+            "exp": exp,
+            "icm": icm,
+            "te": te,
+            "q_proxy": q_proxy,
+        }
+        if include_meta_day and "day" in row:
+            meta["day"] = row.get("day")
+
+        records.append(
+            {
+                "image_path": row.get("image_path"),
+                "targets": targets,
+                "meta": meta,
+            }
+        )
+        stats["kept"] += 1
+
+    get_logger("ivf").info("Q records (%s): %s", context, stats)
+    return records
+
+
 def _build_stage_records(df: pd.DataFrame, include_meta_day: bool) -> list:
     records = []
     for _, row in df.iterrows():
@@ -477,6 +568,7 @@ class IVFDataModule(pl.LightningDataModule):
         morph_labeled_oversample_ratio: float = 0.5,
         morph_balance_icm_te: bool = False,
         morph_labeled_mix_ratio: float = 0.5,
+        q_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         super().__init__()
         self.phase = phase
@@ -496,6 +588,7 @@ class IVFDataModule(pl.LightningDataModule):
         self.morph_labeled_oversample_ratio = morph_labeled_oversample_ratio
         self.morph_balance_icm_te = morph_balance_icm_te
         self.morph_labeled_mix_ratio = morph_labeled_mix_ratio
+        self.q_weights = q_weights
         self.morph_labeled_idx = []
         self.morph_icm_counts = None
         self.morph_te_counts = None
@@ -612,7 +705,7 @@ class IVFDataModule(pl.LightningDataModule):
         )
         assert_no_augmentation(eval_tf)
         logger = get_logger("ivf")
-        if "hungvuong" in self.splits and self.phase in {"morph", "stage", "joint", "quality"}:
+        if "hungvuong" in self.splits and self.phase in {"morph", "stage", "joint", "quality", "q"}:
             logger.warning("Hung Vuong splits present during phase=%s; ignored for training.", self.phase)
 
         if self.phase == "morph":
@@ -785,6 +878,50 @@ class IVFDataModule(pl.LightningDataModule):
                     root_dir=self._root_dir("quality"),
                 )
             logger.info("Quality train size=%s val size=%s test size=%s", len(self.train_dataset), len(self.val_dataset), len(self.test_dataset) if self.test_dataset else 0)
+        elif self.phase == "q":
+            train_df = _load_split_df(self.splits["blastocyst"], "train")
+            val_df = _load_split_df(self.splits["blastocyst"], "val")
+            try:
+                test_df = _load_split_df(self.splits["blastocyst"], "test")
+            except FileNotFoundError:
+                test_df = None
+            group_col = _resolve_group_col(train_df, self.splits["blastocyst"], ("patient_id", "embryo_id"))
+            _assert_no_group_overlap_dfs(train_df, val_df, test_df, group_col, context="blastocyst")
+            self.train_dataset = BaseImageDataset(
+                _build_q_records(
+                    train_df,
+                    self.include_meta_day,
+                    context="q_train",
+                    q_weights=self.q_weights,
+                ),
+                transform=train_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("blastocyst"),
+            )
+            self.val_dataset = BaseImageDataset(
+                _build_q_records(
+                    val_df,
+                    self.include_meta_day,
+                    context="q_val",
+                    q_weights=self.q_weights,
+                ),
+                transform=eval_tf,
+                include_meta_day=self.include_meta_day,
+                root_dir=self._root_dir("blastocyst"),
+            )
+            if test_df is not None:
+                self.test_dataset = BaseImageDataset(
+                    _build_q_records(
+                        test_df,
+                        self.include_meta_day,
+                        context="q_test",
+                        q_weights=self.q_weights,
+                    ),
+                    transform=eval_tf,
+                    include_meta_day=self.include_meta_day,
+                    root_dir=self._root_dir("blastocyst"),
+                )
+            logger.info("Q train size=%s val size=%s test size=%s", len(self.train_dataset), len(self.val_dataset), len(self.test_dataset) if self.test_dataset else 0)
         else:
             raise ValueError(f"Unsupported phase: {self.phase}")
 

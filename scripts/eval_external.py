@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Dict, Optional
 
 import torch
 import numpy as np
@@ -21,8 +22,14 @@ sys.path.append(str(ROOT / "src"))
 
 from ivf.config import load_experiment_config
 from ivf.data.datasets import collate_batch
-from ivf.data.label_schema import EXPANSION_CLASSES
-from ivf.eval import build_quality_dataset_from_df, compute_metrics, predict, slice_by_day
+from ivf.data.label_schema import (
+    EXPANSION_CLASSES,
+    normalize_gardner_exp,
+    normalize_gardner_grade,
+    parse_gardner_components,
+    q_proxy_from_components,
+)
+from ivf.eval import _normalize_day, build_quality_dataset_from_df, compute_metrics, predict, slice_by_day
 from ivf.models.encoder import ConvNeXtMini
 from ivf.models.multitask import MultiTaskEmbryoNet
 from ivf.utils.guardrails import assert_no_hungvuong_training
@@ -35,6 +42,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate on external Hung Vuong dataset.")
     parser.add_argument("--config", default="configs/experiment/base.yaml", help="Experiment config path.")
     parser.add_argument("--checkpoint", default=None, help="Optional path to phase4 checkpoint.")
+    parser.add_argument("--q_checkpoint", default=None, help="Optional path to phase4_q checkpoint.")
     parser.add_argument("--output-dir", default=None, help="Output directory for reports.")
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
     parser.add_argument("--device", default=None, help="cpu or cuda[:index]")
@@ -73,6 +81,11 @@ def parse_args():
         "--analysis_morph_rule",
         action="store_true",
         help="Analysis-only: derive quality from predicted morphology.",
+    )
+    parser.add_argument(
+        "--eval_q",
+        action="store_true",
+        help="Also evaluate q head and write external_q_metrics.json.",
     )
     return parser.parse_args()
 
@@ -238,6 +251,235 @@ def _metrics_block(prob_good, y_true, days, threshold: float | None = None):
         day3["f1"] = _f1_at_threshold(day3_probs, day3_true, threshold)
         day5["f1"] = _f1_at_threshold(day5_probs, day5_true, threshold)
     return overall, day3, day5
+
+
+def _predict_q(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    include_unlabeled: bool = True,
+) -> Dict[str, list]:
+    model.eval()
+    q_scores = []
+    y_true = []
+    days = []
+    image_ids = []
+    domains = []
+    exp_vals = []
+    icm_vals = []
+    te_vals = []
+    grade_vals = []
+    gardner_vals = []
+    label_sources = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            outputs = model(images)
+            if "q" not in outputs:
+                raise RuntimeError("Model forward missing q output.")
+            q_pred = outputs["q"].detach().cpu()
+            targets = batch["targets"].get("quality")
+            if isinstance(targets, torch.Tensor):
+                targets = targets.detach().cpu()
+            else:
+                targets = torch.tensor(targets)
+
+            meta = batch.get("meta", {})
+            if isinstance(meta, list):
+                ids = [m.get("id") for m in meta]
+                day_vals = [m.get("day") for m in meta]
+                domain_vals = [m.get("dataset") for m in meta]
+                exp_meta = [m.get("exp") for m in meta]
+                icm_meta = [m.get("icm") for m in meta]
+                te_meta = [m.get("te") for m in meta]
+                grade_meta = [m.get("grade") for m in meta]
+                gardner_meta = [m.get("gardner") for m in meta]
+                label_meta = [m.get("label_source") for m in meta]
+            elif isinstance(meta, dict):
+                ids = meta.get("id")
+                day_vals = meta.get("day")
+                domain_vals = meta.get("dataset")
+                exp_meta = meta.get("exp")
+                icm_meta = meta.get("icm")
+                te_meta = meta.get("te")
+                grade_meta = meta.get("grade")
+                gardner_meta = meta.get("gardner")
+                label_meta = meta.get("label_source")
+            else:
+                ids = None
+                day_vals = None
+                domain_vals = None
+                exp_meta = None
+                icm_meta = None
+                te_meta = None
+                grade_meta = None
+                gardner_meta = None
+                label_meta = None
+
+            if ids is None:
+                ids = [None] * len(q_pred)
+            if day_vals is None:
+                day_vals = [None] * len(q_pred)
+            if domain_vals is None:
+                domain_vals = [None] * len(q_pred)
+            if exp_meta is None:
+                exp_meta = [None] * len(q_pred)
+            if icm_meta is None:
+                icm_meta = [None] * len(q_pred)
+            if te_meta is None:
+                te_meta = [None] * len(q_pred)
+            if grade_meta is None:
+                grade_meta = [None] * len(q_pred)
+            if gardner_meta is None:
+                gardner_meta = [None] * len(q_pred)
+            if label_meta is None:
+                label_meta = [None] * len(q_pred)
+            if not isinstance(day_vals, list):
+                day_vals = [day_vals] * len(q_pred)
+            if not isinstance(domain_vals, list):
+                domain_vals = [domain_vals] * len(q_pred)
+            if not isinstance(exp_meta, list):
+                exp_meta = [exp_meta] * len(q_pred)
+            if not isinstance(icm_meta, list):
+                icm_meta = [icm_meta] * len(q_pred)
+            if not isinstance(te_meta, list):
+                te_meta = [te_meta] * len(q_pred)
+            if not isinstance(grade_meta, list):
+                grade_meta = [grade_meta] * len(q_pred)
+            if not isinstance(gardner_meta, list):
+                gardner_meta = [gardner_meta] * len(q_pred)
+            if not isinstance(label_meta, list):
+                label_meta = [label_meta] * len(q_pred)
+
+            for i in range(len(q_pred)):
+                label_val = None
+                if i < len(targets) and targets[i] >= 0:
+                    label_val = int(targets[i])
+                if not include_unlabeled and label_val is None:
+                    continue
+                q_scores.append(float(q_pred[i]))
+                y_true.append(label_val)
+                image_ids.append(str(ids[i]))
+                days.append(_normalize_day(day_vals[i]))
+                domains.append(domain_vals[i])
+                exp_vals.append(exp_meta[i])
+                icm_vals.append(icm_meta[i])
+                te_vals.append(te_meta[i])
+                grade_vals.append(grade_meta[i])
+                gardner_vals.append(gardner_meta[i])
+                label_sources.append(label_meta[i])
+
+    return {
+        "q_score": q_scores,
+        "y_true": y_true,
+        "day": days,
+        "image_id": image_ids,
+        "domain": domains,
+        "exp_raw": exp_vals,
+        "icm_raw": icm_vals,
+        "te_raw": te_vals,
+        "grade_raw": grade_vals,
+        "gardner_raw": gardner_vals,
+        "label_source": label_sources,
+    }
+
+
+def _spearman_corr(x_vals, y_vals) -> Optional[float]:
+    if len(x_vals) < 2:
+        return None
+    x_series = pd.Series(x_vals)
+    y_series = pd.Series(y_vals)
+    x_rank = x_series.rank(method="average").to_numpy(dtype=float)
+    y_rank = y_series.rank(method="average").to_numpy(dtype=float)
+    if np.std(x_rank) == 0 or np.std(y_rank) == 0:
+        return None
+    return float(np.corrcoef(x_rank, y_rank)[0, 1])
+
+
+def _regression_metrics(scores, targets) -> Dict[str, Optional[float]]:
+    if not scores:
+        return {"mae": None, "rmse": None, "spearman": None}
+    scores_arr = np.array(scores, dtype=float)
+    targets_arr = np.array(targets, dtype=float)
+    mae = float(np.mean(np.abs(scores_arr - targets_arr)))
+    rmse = float(np.sqrt(np.mean((scores_arr - targets_arr) ** 2)))
+    spearman = _spearman_corr(scores_arr, targets_arr)
+    return {"mae": mae, "rmse": rmse, "spearman": spearman}
+
+
+def _compute_q_proxy_values(preds: Dict[str, list], use_exp_cols: bool, weights: dict) -> Dict[str, list]:
+    q_proxy = []
+    q_source = []
+    exp_gt = []
+    icm_gt = []
+    te_gt = []
+    for exp_raw, icm_raw, te_raw, grade_raw, gardner_raw in zip(
+        preds.get("exp_raw", []),
+        preds.get("icm_raw", []),
+        preds.get("te_raw", []),
+        preds.get("grade_raw", []),
+        preds.get("gardner_raw", []),
+    ):
+        if use_exp_cols:
+            exp_val = normalize_gardner_exp(exp_raw)
+            icm_val = normalize_gardner_grade(icm_raw)
+            te_val = normalize_gardner_grade(te_raw)
+            q_val = q_proxy_from_components(exp_val, icm_val, te_val, weights=weights)
+            source = "exp_icm_te"
+        else:
+            raw = gardner_raw if gardner_raw is not None else grade_raw
+            components = parse_gardner_components(raw)
+            exp_val = icm_val = te_val = None
+            if components is not None:
+                exp_val, icm_val, te_val = components
+            q_val = q_proxy_from_components(exp_val, icm_val, te_val, weights=weights)
+            source = "gardner_parse"
+        exp_gt.append(exp_val)
+        icm_gt.append(icm_val)
+        te_gt.append(te_val)
+        q_proxy.append(q_val)
+        q_source.append(source)
+    return {
+        "q_proxy": q_proxy,
+        "q_proxy_source": q_source,
+        "exp_gt": exp_gt,
+        "icm_gt": icm_gt,
+        "te_gt": te_gt,
+    }
+
+
+def _filter_binary_preds(preds: Dict[str, list]) -> Dict[str, list]:
+    scores = []
+    labels = []
+    days = []
+    domains = []
+    for score, label, day, domain in zip(
+        preds.get("q_score", []),
+        preds.get("y_true", []),
+        preds.get("day", []),
+        preds.get("domain", []),
+    ):
+        if label is None:
+            continue
+        scores.append(score)
+        labels.append(int(label))
+        days.append(day)
+        domains.append(domain)
+    return {"q_score": scores, "y_true": labels, "day": days, "domain": domains}
+
+
+def _load_q_thresholds(reports_dir: Path, logger) -> dict:
+    path = reports_dir / "q_thresholds.json"
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logger.warning("Failed to read q thresholds from %s", path)
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=None) -> None:
@@ -513,6 +755,229 @@ def main():
         logger.info("Analysis oracle: %s", metrics.get("analysis_oracle"))
     if "analysis_morph_rule" in metrics:
         logger.info("Analysis morph rule: %s", metrics.get("analysis_morph_rule"))
+
+    if args.eval_q:
+        q_ckpt_path = args.q_checkpoint or (Path(cfg.outputs.checkpoints_dir) / "phase4_q.ckpt")
+        q_ckpt_path = Path(q_ckpt_path)
+        if not q_ckpt_path.exists():
+            logger.warning("Q checkpoint not found: %s; skipping q eval.", q_ckpt_path)
+            return
+        q_model = build_model(cfg)
+        logger.info("Loading Q checkpoint weights from %s", q_ckpt_path)
+        load_checkpoint(q_model, q_ckpt_path, logger=logger)
+        q_model.to(device)
+
+        q_extra_cols = ["exp", "icm", "te", "grade", "gardner"]
+        grade_col = hung_cfg.get("grade_col") or hung_cfg.get("label_col")
+        if grade_col and grade_col not in q_extra_cols:
+            q_extra_cols.append(grade_col)
+
+        q_val_dataset = build_quality_dataset_from_df(
+            val_df,
+            hung_cfg,
+            image_size=cfg.transforms.image_size,
+            normalize=cfg.transforms.normalize,
+            mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+            std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+            keep_unlabeled=True,
+            extra_meta_cols=q_extra_cols,
+        )
+        q_test_dataset = build_quality_dataset_from_df(
+            test_df,
+            hung_cfg,
+            image_size=cfg.transforms.image_size,
+            normalize=cfg.transforms.normalize,
+            mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+            std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+            keep_unlabeled=True,
+            extra_meta_cols=q_extra_cols,
+        )
+        q_val_loader = DataLoader(
+            q_val_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_batch,
+        )
+        q_test_loader = DataLoader(
+            q_test_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_batch,
+        )
+
+        q_preds_val = _predict_q(q_model, q_val_loader, device, include_unlabeled=True)
+        q_preds_test = _predict_q(q_model, q_test_loader, device, include_unlabeled=True)
+
+        q_cfg = getattr(cfg.training, "q", None)
+        q_weights = getattr(q_cfg, "q_weights", {}) if q_cfg is not None else {}
+        use_exp_cols_val = all(col in val_df.columns for col in ("exp", "icm", "te"))
+        use_exp_cols_test = all(col in test_df.columns for col in ("exp", "icm", "te"))
+        proxy_val = _compute_q_proxy_values(q_preds_val, use_exp_cols_val, q_weights)
+        proxy_test = _compute_q_proxy_values(q_preds_test, use_exp_cols_test, q_weights)
+
+        def _proxy_metrics(preds, proxy):
+            scores = []
+            targets = []
+            for score, target in zip(preds.get("q_score", []), proxy.get("q_proxy", [])):
+                if target is None:
+                    continue
+                scores.append(score)
+                targets.append(target)
+            return _regression_metrics(scores, targets), scores, targets
+
+        proxy_val_metrics, _, proxy_val_targets = _proxy_metrics(q_preds_val, proxy_val)
+        proxy_test_metrics, _, proxy_test_targets = _proxy_metrics(q_preds_test, proxy_test)
+
+        q_metrics = {
+            "proxy_regression": {
+                "val": proxy_val_metrics,
+                "test": proxy_test_metrics,
+            }
+        }
+
+        labeled_test = _filter_binary_preds(q_preds_test)
+        if labeled_test["y_true"]:
+            q_overall = compute_metrics(labeled_test["q_score"], labeled_test["y_true"])
+            q_day3_probs, q_day3_true = slice_by_day(
+                {"prob_good": labeled_test["q_score"], "y_true": labeled_test["y_true"], "day": labeled_test["day"]},
+                3,
+            )
+            q_day5_probs, q_day5_true = slice_by_day(
+                {"prob_good": labeled_test["q_score"], "y_true": labeled_test["y_true"], "day": labeled_test["day"]},
+                5,
+            )
+            q_day3 = compute_metrics(q_day3_probs, q_day3_true)
+            q_day5 = compute_metrics(q_day5_probs, q_day5_true)
+            q_metrics["binary"] = {
+                "overall": q_overall,
+                "day3": q_day3,
+                "day5": q_day5,
+            }
+
+            thresholds = _load_q_thresholds(output_dir, logger)
+            global_thresh = None
+            if isinstance(thresholds.get("global"), dict):
+                global_thresh = thresholds["global"].get("threshold")
+
+            def _pick_threshold(domain, day):
+                by_domain = thresholds.get("by_domain", {})
+                by_stage = thresholds.get("by_stage", {})
+                if domain and isinstance(by_domain, dict) and domain in by_domain:
+                    return by_domain[domain].get("threshold")
+                if day is not None and isinstance(by_stage, dict) and str(day) in by_stage:
+                    return by_stage[str(day)].get("threshold")
+                return global_thresh
+
+            def _threshold_metrics(scores, labels, days, domains):
+                if not scores:
+                    return {"f1": None, "acc": None}
+                preds = []
+                for score, day_val, domain in zip(scores, days, domains):
+                    thresh = _pick_threshold(domain, day_val)
+                    if thresh is None:
+                        thresh = 0.5
+                    preds.append(1 if score >= thresh else 0)
+                y = np.array(labels)
+                p = np.array(preds)
+                acc = float((p == y).mean()) if len(y) else None
+                tp = int(((p == 1) & (y == 1)).sum())
+                fp = int(((p == 1) & (y == 0)).sum())
+                fn = int(((p == 0) & (y == 1)).sum())
+                denom = (2 * tp + fp + fn)
+                f1 = (2 * tp / denom) if denom > 0 else 0.0
+                return {"f1": f1, "acc": acc}
+
+            q_thresh_overall = _threshold_metrics(
+                labeled_test["q_score"],
+                labeled_test["y_true"],
+                labeled_test["day"],
+                labeled_test["domain"],
+            )
+            day3_domains = [d for d, day in zip(labeled_test["domain"], labeled_test["day"]) if day == 3]
+            day5_domains = [d for d, day in zip(labeled_test["domain"], labeled_test["day"]) if day == 5]
+            q_thresh_day3 = _threshold_metrics(q_day3_probs, q_day3_true, [3] * len(q_day3_probs), day3_domains)
+            q_thresh_day5 = _threshold_metrics(q_day5_probs, q_day5_true, [5] * len(q_day5_probs), day5_domains)
+
+            q_metrics["thresholded"] = {
+                "overall": q_thresh_overall,
+                "day3": q_thresh_day3,
+                "day5": q_thresh_day5,
+            }
+        elif proxy_test_targets:
+            if proxy_val_targets:
+                derived_threshold = float(np.median(proxy_val_targets))
+                threshold_source = "val_median"
+            else:
+                derived_threshold = float(np.median(proxy_test_targets))
+                threshold_source = "test_median"
+
+            derived_scores = []
+            derived_labels = []
+            derived_days = []
+            for score, target, day in zip(q_preds_test["q_score"], proxy_test["q_proxy"], q_preds_test["day"]):
+                if target is None:
+                    continue
+                derived_scores.append(score)
+                derived_labels.append(1 if target >= derived_threshold else 0)
+                derived_days.append(day)
+
+            proxy_overall = compute_metrics(derived_scores, derived_labels)
+            proxy_day3_probs, proxy_day3_true = slice_by_day(
+                {"prob_good": derived_scores, "y_true": derived_labels, "day": derived_days},
+                3,
+            )
+            proxy_day5_probs, proxy_day5_true = slice_by_day(
+                {"prob_good": derived_scores, "y_true": derived_labels, "day": derived_days},
+                5,
+            )
+            q_metrics["proxy_binary"] = {
+                "threshold": derived_threshold,
+                "threshold_source": threshold_source,
+                "overall": proxy_overall,
+                "day3": compute_metrics(proxy_day3_probs, proxy_day3_true),
+                "day5": compute_metrics(proxy_day5_probs, proxy_day5_true),
+            }
+        q_metrics_path = output_dir / "external_q_metrics.json"
+        with open(q_metrics_path, "w", encoding="utf-8") as f:
+            json.dump(q_metrics, f, indent=2)
+
+        q_preds_path = output_dir / "external_q_predictions.csv"
+        with open(q_preds_path, "w", encoding="utf-8") as f:
+            f.write("image_id,domain,stage,q_score,label_binary,exp_gt,icm_gt,te_gt,gardner_raw,q_proxy_external,q_proxy_source\n")
+            for idx, (image_id, score, label, day_val, domain) in enumerate(
+                zip(
+                    q_preds_test["image_id"],
+                    q_preds_test["q_score"],
+                    q_preds_test["y_true"],
+                    q_preds_test["day"],
+                    q_preds_test["domain"],
+                )
+            ):
+                stage = "" if day_val is None else day_val
+                dom = "" if domain is None else domain
+                exp_gt = proxy_test["exp_gt"][idx] if idx < len(proxy_test["exp_gt"]) else None
+                icm_gt = proxy_test["icm_gt"][idx] if idx < len(proxy_test["icm_gt"]) else None
+                te_gt = proxy_test["te_gt"][idx] if idx < len(proxy_test["te_gt"]) else None
+                gardner_raw = q_preds_test["gardner_raw"][idx] if idx < len(q_preds_test["gardner_raw"]) else None
+                if gardner_raw is None:
+                    gardner_raw = q_preds_test["grade_raw"][idx] if idx < len(q_preds_test["grade_raw"]) else None
+                q_proxy_val = proxy_test["q_proxy"][idx] if idx < len(proxy_test["q_proxy"]) else None
+                q_source = proxy_test["q_proxy_source"][idx] if idx < len(proxy_test["q_proxy_source"]) else None
+                label_str = "" if label is None else str(label)
+                exp_str = "" if exp_gt is None else str(exp_gt)
+                icm_str = "" if icm_gt is None else str(icm_gt)
+                te_str = "" if te_gt is None else str(te_gt)
+                gardner_str = "" if gardner_raw is None else str(gardner_raw)
+                proxy_str = "" if q_proxy_val is None else f"{q_proxy_val:.6f}"
+                source_str = "" if q_source is None else str(q_source)
+                f.write(
+                    f"{image_id},{dom},{stage},{score:.6f},{label_str},{exp_str},{icm_str},{te_str},{gardner_str},{proxy_str},{source_str}\n"
+                )
+
+        logger.info("Saved q metrics to %s", q_metrics_path)
+        logger.info("Saved q predictions to %s", q_preds_path)
 
 
 if __name__ == "__main__":

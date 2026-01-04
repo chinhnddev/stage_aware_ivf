@@ -45,6 +45,7 @@ class TransformConfig:
     stage: str = "medium"
     joint: str = "light"
     quality: str = "light"
+    q: str = "light"
     normalize: bool = False
     mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
@@ -73,16 +74,26 @@ class LossConfig:
 class TrainingConfig:
     lr: float = 0.001
     weight_decay: float = 0.0001
-    epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10})
-    loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0})
+    epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10, "q": 10})
+    loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0, "q": 1.0})
     morph_loss_reduction: str = "mean"
     morph_labeled_oversample_ratio: float = 0.5
     loss: LossConfig = field(default_factory=LossConfig)
     morph: MorphTrainingConfig = field(default_factory=MorphTrainingConfig)
+    q: "QTrainingConfig" = field(default_factory=lambda: QTrainingConfig())
     joint_sampling: str = "balanced"
     quality_sampling: str = "proportional"
     require_prev_ckpt: bool = True
     freeze: FreezeConfig = field(default_factory=FreezeConfig)
+
+
+@dataclass
+class QTrainingConfig:
+    q_loss: str = "smoothl1"
+    q_weights: Dict[str, float] = field(default_factory=lambda: {"exp": 0.4, "icm": 0.3, "te": 0.3})
+    freeze_backbone: bool = True
+    aux_alpha: float = 0.0
+    unfreeze_last_n_blocks: int = 0
 
 
 @dataclass

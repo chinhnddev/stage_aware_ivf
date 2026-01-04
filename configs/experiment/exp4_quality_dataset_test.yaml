@@ -1,0 +1,4 @@
+base_config: configs/experiment/base.yaml
+
+data:
+  quality_config: configs/data/dataset_test_quality.yaml

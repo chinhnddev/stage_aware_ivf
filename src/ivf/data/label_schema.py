@@ -50,6 +50,7 @@ QUALITY_TO_ID: Dict[QualityLabel, int] = {label: idx for idx, label in enumerate
 
 MISSING_GARDNER_TOKENS = {"", "0", "ND", "NA", "N/A"}
 ICM_TE_NUMERIC_MAP = {1: "A", 2: "B", 3: "C"}
+DEFAULT_Q_WEIGHTS = {"exp": 0.4, "icm": 0.3, "te": 0.3}
 
 _GARDNER_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])(?P<te>[ABCabc123])\s*$")
 _GARDNER_COMPONENT_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])?(?P<te>[ABCabc123])?\s*$")
@@ -211,3 +212,38 @@ def gardner_to_morphology_targets(
         "icm_mask": icm_mask,
         "te_mask": te_mask,
     }
+
+
+def q_proxy_from_components(
+    exp_value,
+    icm_value,
+    te_value,
+    weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """
+    Compute a continuous quality proxy in [0, 1] from GT Gardner components.
+
+    Returns None when any component is missing/invalid.
+    """
+    exp = normalize_gardner_exp(exp_value)
+    icm = normalize_gardner_grade(icm_value)
+    te = normalize_gardner_grade(te_value)
+    if exp is None or icm is None or te is None:
+        return None
+
+    def _grade_score(value: str) -> float:
+        return {"A": 1.0, "B": 0.5, "C": 0.0}[value]
+
+    exp_norm = max(0.0, min(1.0, (exp - 1) / 5.0))
+    icm_score = _grade_score(icm)
+    te_score = _grade_score(te)
+
+    weights = dict(DEFAULT_Q_WEIGHTS if weights is None else weights)
+    w_exp = float(weights.get("exp", DEFAULT_Q_WEIGHTS["exp"]))
+    w_icm = float(weights.get("icm", DEFAULT_Q_WEIGHTS["icm"]))
+    w_te = float(weights.get("te", DEFAULT_Q_WEIGHTS["te"]))
+    total = w_exp + w_icm + w_te
+    if total <= 0:
+        return None
+    q = (w_exp * exp_norm + w_icm * icm_score + w_te * te_score) / total
+    return max(0.0, min(1.0, float(q)))

@@ -30,6 +30,11 @@ class MultiTaskEmbryoNet(nn.Module):
         self.encoder = encoder if encoder is not None else ConvNeXtMini(feature_dim=feature_dim)
         self.morph = MorphologyHeads(feature_dim)
         self.stage = StageHead(feature_dim)
+        self.q_head = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, 1),
+        )
         self.quality_conditioning = quality_conditioning
         if quality_conditioning == "none":
             self.quality = QualityHead(feature_dim)
@@ -45,6 +50,8 @@ class MultiTaskEmbryoNet(nn.Module):
         features = self.encoder(x)
         morph_logits = self.morph(features)
         stage_logits = self.stage(features)
+        q_logits = self.q_head(features)
+        q_pred = torch.sigmoid(q_logits).squeeze(-1)
 
         if self.quality_conditioning == "none":
             quality_logits = self.quality(features)
@@ -74,4 +81,5 @@ class MultiTaskEmbryoNet(nn.Module):
             "morph": morph_logits,
             "stage": stage_logits,
             "quality": quality_logits,
+            "q": q_pred,
         }

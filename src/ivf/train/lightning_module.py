@@ -34,6 +34,9 @@ class MultiTaskLightningModule(pl.LightningModule):
         quality_pos_weight: Optional[float] = None,
         use_class_weights: bool = False,
         class_weight_mode: str = "inverse_freq",
+        q_loss: str = "smoothl1",
+        q_aux_alpha: float = 0.0,
+        q_freeze_backbone: bool = True,
         live_epoch_line: bool = False,
     ) -> None:
         super().__init__()
@@ -52,6 +55,9 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.quality_pos_weight = quality_pos_weight
         self.use_class_weights = use_class_weights
         self.class_weight_mode = class_weight_mode
+        self.q_loss = q_loss
+        self.q_aux_alpha = q_aux_alpha
+        self.q_freeze_backbone = q_freeze_backbone
         self.live_epoch_line = live_epoch_line
         self._epoch_start_time = None
         self._val_pred_counts = None
@@ -76,6 +82,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
         if self.class_weight_mode not in {"inverse_freq"}:
             raise ValueError(f"Unsupported class_weight_mode: {self.class_weight_mode}")
+        if self.q_loss not in {"smoothl1", "mse"}:
+            raise ValueError(f"Unsupported q_loss: {self.q_loss}")
 
         self._apply_phase_freeze(initial=True)
 
@@ -93,6 +101,19 @@ class MultiTaskLightningModule(pl.LightningModule):
         def _set_trainable(module: nn.Module, trainable: bool) -> None:
             for p in module.parameters():
                 p.requires_grad = trainable
+
+        def _unfreeze_last_encoder_blocks(n_blocks: int) -> None:
+            if n_blocks <= 0:
+                return
+            encoder = getattr(self.model, "encoder", None)
+            blocks = getattr(encoder, "blocks", None)
+            if blocks is None:
+                logger.warning("Encoder blocks not found; q_unfreeze_last_n_blocks ignored.")
+                return
+            for block in list(blocks)[-n_blocks:]:
+                _set_trainable(block, True)
+            if hasattr(encoder, "proj"):
+                _set_trainable(encoder.proj, True)
 
         if self.phase == "morph":
             _set_trainable(self.model.encoder, True)
@@ -121,6 +142,23 @@ class MultiTaskLightningModule(pl.LightningModule):
             _set_trainable(self.model.stage, False)
             _set_trainable(self.model.quality, True)
             logger.info("EXP-4 Quality: encoder+morph+stage frozen; quality trainable.")
+        elif self.phase == "q":
+            if self.q_freeze_backbone:
+                freeze_encoder(self.model, ratio=1.0)
+            else:
+                _set_trainable(self.model.encoder, True)
+            _set_trainable(self.model.morph, False)
+            _set_trainable(self.model.stage, False)
+            _set_trainable(self.model.quality, False)
+            _set_trainable(self.model.q_head, True)
+            unfreeze_blocks = int(self.freeze_config.get("q_unfreeze_last_n_blocks", 0))
+            if self.q_freeze_backbone and unfreeze_blocks > 0:
+                _unfreeze_last_encoder_blocks(unfreeze_blocks)
+                logger.info("EXP-4Q: encoder frozen except last %s blocks; q_head trainable.", unfreeze_blocks)
+            elif self.q_freeze_backbone:
+                logger.info("EXP-4Q: encoder+morph+stage+quality frozen; q_head trainable.")
+            else:
+                logger.info("EXP-4Q: encoder unfrozen; q_head trainable.")
         else:
             raise ValueError(f"Unsupported phase: {self.phase}")
 
@@ -257,6 +295,27 @@ class MultiTaskLightningModule(pl.LightningModule):
             loss = loss * class_weight.gather(0, targets)
         return loss.mean() * weight
 
+    def _masked_regression_loss(
+        self,
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        weight: float,
+    ) -> Optional[torch.Tensor]:
+        if mask is None:
+            mask = targets >= 0
+        else:
+            mask = mask > 0
+        if not mask.any():
+            return None
+        preds = preds[mask].float()
+        targets = targets[mask].float()
+        if self.q_loss == "mse":
+            loss = F.mse_loss(preds, targets)
+        else:
+            loss = F.smooth_l1_loss(preds, targets)
+        return loss * weight
+
     def _compute_losses(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
         losses = {}
 
@@ -344,6 +403,59 @@ class MultiTaskLightningModule(pl.LightningModule):
                 if quality_loss is not None:
                     losses["quality"] = quality_loss
 
+        if self.phase == "q":
+            q_loss = self._masked_regression_loss(
+                outputs["q"],
+                targets["q"],
+                targets.get("q_mask"),
+                self.loss_weights.get("q", 1.0),
+            )
+            if q_loss is not None:
+                losses["q"] = q_loss
+
+            if self.q_aux_alpha > 0:
+                aux_losses = []
+                loss_exp = self._masked_ce(
+                    outputs["morph"]["exp"],
+                    targets["exp"],
+                    targets.get("exp_mask"),
+                    self.q_aux_alpha,
+                    class_weight=self.exp_class_weight,
+                    num_classes=len(EXPANSION_CLASSES),
+                )
+                if loss_exp is not None:
+                    aux_losses.append(loss_exp)
+                loss_icm = self._masked_ce(
+                    outputs["morph"]["icm"],
+                    targets["icm"],
+                    targets.get("icm_mask"),
+                    self.q_aux_alpha,
+                    class_weight=self.icm_class_weight,
+                    num_classes=self.icm_num_classes,
+                )
+                if loss_icm is not None:
+                    aux_losses.append(loss_icm)
+                loss_te = self._masked_ce(
+                    outputs["morph"]["te"],
+                    targets["te"],
+                    targets.get("te_mask"),
+                    self.q_aux_alpha,
+                    class_weight=self.te_class_weight,
+                    num_classes=self.te_num_classes,
+                )
+                if loss_te is not None:
+                    aux_losses.append(loss_te)
+                stage_loss = self._masked_ce(
+                    outputs["stage"],
+                    targets.get("stage", torch.tensor(IGNORE_INDEX, device=outputs["stage"].device)),
+                    None,
+                    self.q_aux_alpha,
+                )
+                if stage_loss is not None:
+                    aux_losses.append(stage_loss)
+                if aux_losses:
+                    losses["q_aux"] = sum(aux_losses)
+
         total = sum(losses.values()) if losses else torch.tensor(0.0, device=outputs["features"].device)
         losses["total"] = total
         return losses
@@ -360,6 +472,10 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.log("train/stage_loss", losses["stage"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         if "quality" in losses:
             self.log("train/quality_loss", losses["quality"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q" in losses:
+            self.log("train/q_loss", losses["q"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q_aux" in losses:
+            self.log("train/q_aux_loss", losses["q_aux"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         return losses["total"]
 
     def validation_step(self, batch: Dict, batch_idx: int):
@@ -374,6 +490,10 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.log("val/stage_loss", losses["stage"], on_epoch=True, prog_bar=False, batch_size=batch_size)
         if "quality" in losses:
             self.log("val/quality_loss", losses["quality"], on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q" in losses:
+            self.log("val/q_loss", losses["q"], on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q_aux" in losses:
+            self.log("val/q_aux_loss", losses["q_aux"], on_epoch=True, prog_bar=False, batch_size=batch_size)
 
         targets = batch["targets"]
 
@@ -449,6 +569,25 @@ class MultiTaskLightningModule(pl.LightningModule):
                     metric.update(probs[mask], t[mask])
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False, batch_size=batch_size)
 
+        if self.phase == "q":
+            q_target = targets["q"].float()
+            mask = targets.get("q_mask")
+            mask = mask > 0 if mask is not None else q_target >= 0
+            q_n = int(mask.sum().item())
+            if q_n > 0:
+                q_pred = outputs["q"][mask].float()
+                q_true = q_target[mask]
+                rmse = torch.sqrt(torch.mean((q_pred - q_true) ** 2))
+                mae = torch.mean(torch.abs(q_pred - q_true))
+                self.log("val/q_rmse", rmse, on_epoch=True, prog_bar=False, batch_size=batch_size)
+                self.log("val/q_mae", mae, on_epoch=True, prog_bar=False, batch_size=batch_size)
+                self.log("val/q_n", q_n, on_epoch=True, prog_bar=False, batch_size=batch_size)
+            else:
+                device = getattr(self, "device", None) or q_target.device
+                self.log("val/q_rmse", torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False, batch_size=batch_size)
+                self.log("val/q_mae", torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False, batch_size=batch_size)
+                self.log("val/q_n", 0, on_epoch=True, prog_bar=False, batch_size=batch_size)
+
     def on_validation_epoch_end(self) -> None:
         if self.trainer and getattr(self.trainer, "sanity_checking", False):
             return
@@ -492,6 +631,9 @@ class MultiTaskLightningModule(pl.LightningModule):
             _append(parts, "val_auprc", "val/quality_auprc")
             _append(parts, "val_f1", "val/quality_f1")
             _append(parts, "val_acc", "val/quality_acc")
+        if self.phase == "q":
+            _append(parts, "val_q_rmse", "val/q_rmse")
+            _append(parts, "val_q_mae", "val/q_mae")
 
         if len(parts) > 1:
             get_logger("ivf").info(" ".join(parts))

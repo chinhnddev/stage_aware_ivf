@@ -53,7 +53,7 @@ MISSINGNESS_THRESHOLD = 0.1
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a phase of the IVF pipeline.")
-    parser.add_argument("--phase", required=True, choices=["morph", "stage", "joint", "quality"])
+    parser.add_argument("--phase", required=True, choices=["morph", "stage", "joint", "quality", "q"])
     parser.add_argument("--config", default="configs/experiment/base.yaml", help="Experiment config path.")
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
     parser.add_argument("--device", default=None, help="cpu or cuda[:index]")
@@ -871,6 +871,119 @@ def _tune_quality_threshold(model, dataloader, device: torch.device, reports_dir
     return best
 
 
+def _tune_q_thresholds(model, dataloader, device: torch.device, reports_dir: Path, logger) -> Optional[dict]:
+    payload = {"global": {"threshold": 0.5, "source": "default"}}
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / "q_thresholds.json"
+    if dataloader is None:
+        logger.warning("No val dataloader found; using default q threshold.")
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("Saved q thresholds to %s", out_path)
+        return payload
+    model.to(device)
+    model.eval()
+    q_scores = []
+    y_true = []
+    days = []
+    domains = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            outputs = model(images)
+            if "q" not in outputs:
+                logger.warning("Model outputs missing q; skipping q threshold tuning.")
+                with out_path.open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                logger.info("Saved q thresholds to %s", out_path)
+                return payload
+            q_pred = outputs["q"].detach().cpu()
+            targets = batch["targets"].get("quality")
+            if targets is None:
+                continue
+            if isinstance(targets, torch.Tensor):
+                targets = targets.detach().cpu()
+            else:
+                targets = torch.tensor(targets)
+            mask = targets >= 0
+            meta = batch.get("meta", {})
+            if isinstance(meta, list):
+                day_vals = [m.get("day") for m in meta]
+                domain_vals = [m.get("dataset") for m in meta]
+            elif isinstance(meta, dict):
+                day_vals = meta.get("day")
+                domain_vals = meta.get("dataset")
+            else:
+                day_vals = None
+                domain_vals = None
+            if day_vals is None:
+                day_vals = [None] * len(q_pred)
+            if domain_vals is None:
+                domain_vals = [None] * len(q_pred)
+            if not isinstance(day_vals, list):
+                day_vals = [day_vals] * len(q_pred)
+            if not isinstance(domain_vals, list):
+                domain_vals = [domain_vals] * len(q_pred)
+
+            for i, keep in enumerate(mask.tolist()):
+                if not keep:
+                    continue
+                q_scores.append(float(q_pred[i]))
+                y_true.append(int(targets[i]))
+                days.append(day_vals[i])
+                domains.append(domain_vals[i])
+
+    if not q_scores:
+        logger.warning("No binary labels available for q threshold tuning.")
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("Saved q thresholds to %s", out_path)
+        return payload
+
+    def _best_threshold(scores, labels):
+        best = {"threshold": 0.5, "f1": -1.0, "source": "val"}
+        for thresh in np.arange(0.05, 0.96, 0.01):
+            y_pred = (np.array(scores) >= thresh).astype(int)
+            tp = int(((y_pred == 1) & (np.array(labels) == 1)).sum())
+            fp = int(((y_pred == 1) & (np.array(labels) == 0)).sum())
+            fn = int(((y_pred == 0) & (np.array(labels) == 1)).sum())
+            denom = (2 * tp + fp + fn)
+            f1 = (2 * tp / denom) if denom > 0 else 0.0
+            if f1 > best["f1"]:
+                best = {"threshold": float(thresh), "f1": float(f1)}
+        return best
+
+    payload = {"global": _best_threshold(q_scores, y_true)}
+
+    by_stage = {}
+    for stage in sorted({d for d in days if d is not None}):
+        idx = [i for i, d in enumerate(days) if d == stage]
+        if idx:
+            by_stage[str(stage)] = _best_threshold(
+                [q_scores[i] for i in idx],
+                [y_true[i] for i in idx],
+            )
+    if by_stage:
+        payload["by_stage"] = by_stage
+
+    by_domain = {}
+    for domain in sorted({d for d in domains if d}):
+        idx = [i for i, d in enumerate(domains) if d == domain]
+        if idx:
+            by_domain[str(domain)] = _best_threshold(
+                [q_scores[i] for i in idx],
+                [y_true[i] for i in idx],
+            )
+    if by_domain:
+        payload["by_domain"] = by_domain
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    logger.info("Saved q thresholds to %s", out_path)
+    return payload
+
+
 def _run_quality_test_eval(
     model: torch.nn.Module,
     dataloader,
@@ -936,6 +1049,11 @@ def get_prev_checkpoint(phase: str, checkpoints_dir: Path, cfg):
         if joint_ckpt.exists():
             return joint_ckpt
         return checkpoints_dir / "phase2_stage.ckpt"
+    if phase == "q":
+        joint_ckpt = checkpoints_dir / "phase3_joint.ckpt"
+        if joint_ckpt.exists():
+            return joint_ckpt
+        return checkpoints_dir / "phase2_stage.ckpt"
     return None
 
 
@@ -980,6 +1098,15 @@ def main():
     morph_class_weight_mode = str(getattr(morph_cfg, "class_weight_mode", "inverse_freq")) if morph_cfg is not None else "inverse_freq"
     morph_balance_icm_te = bool(getattr(morph_cfg, "balance_icm_te", False)) if morph_cfg is not None else False
     morph_labeled_mix_ratio = float(getattr(morph_cfg, "labeled_mix_ratio", 0.5)) if morph_cfg is not None else 0.5
+    q_cfg = getattr(phase_cfg, "q", None)
+    q_loss = str(getattr(q_cfg, "q_loss", "smoothl1")) if q_cfg is not None else "smoothl1"
+    q_weights = resolve_config_dict(getattr(q_cfg, "q_weights", None)) if q_cfg is not None else None
+    q_aux_alpha = float(getattr(q_cfg, "aux_alpha", 0.0)) if q_cfg is not None else 0.0
+    q_freeze_backbone = bool(getattr(q_cfg, "freeze_backbone", True)) if q_cfg is not None else True
+    q_unfreeze_last_n_blocks = int(getattr(q_cfg, "unfreeze_last_n_blocks", 0)) if q_cfg is not None else 0
+    if phase == "q" and q_unfreeze_last_n_blocks > 0:
+        freeze_cfg = dict(freeze_cfg or {})
+        freeze_cfg["q_unfreeze_last_n_blocks"] = q_unfreeze_last_n_blocks
     loss_cfg = getattr(phase_cfg, "loss", None)
     loss_use_class_weights = bool(getattr(loss_cfg, "use_class_weights", False)) if loss_cfg is not None else False
     morph_use_class_weights = morph_use_class_weights or loss_use_class_weights
@@ -995,7 +1122,7 @@ def main():
     data_cfg = cfg.data
     splits_base_dir = data_cfg.splits_base_dir
     splits = {}
-    if phase in {"morph", "joint"}:
+    if phase in {"morph", "joint", "q"}:
         blast_split_files = blast_cfg.get("split_files")
         blast_split_entry = (
             {k: str(v) for k, v in blast_split_files.items()}
@@ -1063,11 +1190,14 @@ def main():
         quality_pos_weight=quality_pos_weight,
         use_class_weights=morph_use_class_weights,
         class_weight_mode=morph_class_weight_mode,
+        q_loss=q_loss,
+        q_aux_alpha=q_aux_alpha,
+        q_freeze_backbone=q_freeze_backbone,
         live_epoch_line=args.live_epoch_line,
     )
 
     prev_ckpt = get_prev_checkpoint(phase, checkpoints_dir, cfg)
-    if phase in {"stage", "joint", "quality"} and phase_cfg.require_prev_ckpt and not args.allow_missing_ckpt:
+    if phase in {"stage", "joint", "quality", "q"} and phase_cfg.require_prev_ckpt and not args.allow_missing_ckpt:
         if prev_ckpt is None or not prev_ckpt.exists():
             raise ValueError(
                 f"Missing previous checkpoint for phase={phase}. "
@@ -1088,6 +1218,9 @@ def main():
                 quality_pos_weight=quality_pos_weight,
                 use_class_weights=morph_use_class_weights,
                 class_weight_mode=morph_class_weight_mode,
+                q_loss=q_loss,
+                q_aux_alpha=q_aux_alpha,
+                q_freeze_backbone=q_freeze_backbone,
                 strict=True,
             )
         except RuntimeError as exc:
@@ -1122,6 +1255,7 @@ def main():
         morph_labeled_oversample_ratio=float(getattr(phase_cfg, "morph_labeled_oversample_ratio", 0.5)),
         morph_balance_icm_te=morph_balance_icm_te,
         morph_labeled_mix_ratio=morph_labeled_mix_ratio,
+        q_weights=q_weights,
     )
 
     datamodule.setup()
@@ -1206,6 +1340,17 @@ def main():
                 fallback_mode="min",
             )
         )
+    if phase == "q":
+        best_ckpt_path = checkpoints_dir / "phase4_q.ckpt"
+        callbacks.append(
+            BestMetricCheckpoint(
+                ckpt_path=best_ckpt_path,
+                primary_metric="val/q_rmse",
+                fallback_metric="val/loss",
+                primary_mode="min",
+                fallback_mode="min",
+            )
+        )
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         max_steps=max_steps,
@@ -1227,6 +1372,7 @@ def main():
         "stage": "phase2_stage.ckpt",
         "joint": "phase3_joint.ckpt",
         "quality": "phase4_quality.ckpt",
+        "q": "phase4_q.ckpt",
     }[phase]
     ckpt_path = checkpoints_dir / ckpt_name
     if phase == "quality":
@@ -1252,11 +1398,41 @@ def main():
             quality_pos_weight=quality_pos_weight,
             use_class_weights=morph_use_class_weights,
             class_weight_mode=morph_class_weight_mode,
+            q_loss=q_loss,
+            q_aux_alpha=q_aux_alpha,
+            q_freeze_backbone=q_freeze_backbone,
         )
         _tune_quality_threshold(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
         _run_quality_test_eval(eval_module.model, datamodule.test_dataloader(), reports_dir, eval_device, logger)
+    elif phase == "q":
+        if best_ckpt_path and best_ckpt_path.exists():
+            ckpt_path = best_ckpt_path
+            logger.info("Saved BEST checkpoint: %s", ckpt_path)
+        else:
+            trainer.save_checkpoint(ckpt_path)
+            logger.warning("Best checkpoint not found; saved LAST checkpoint to %s", ckpt_path)
 
-    if phase != "quality":
+        reports_dir = ensure_outputs_dir(cfg.outputs.reports_dir)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        eval_device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
+        eval_module = MultiTaskLightningModule.load_from_checkpoint(
+            checkpoint_path=str(ckpt_path),
+            model=model,
+            phase=phase,
+            lr=phase_cfg.lr,
+            weight_decay=phase_cfg.weight_decay,
+            loss_weights=loss_weights,
+            freeze_config=freeze_cfg,
+            morph_loss_reduction=phase_cfg.morph_loss_reduction,
+            quality_pos_weight=quality_pos_weight,
+            use_class_weights=morph_use_class_weights,
+            class_weight_mode=morph_class_weight_mode,
+            q_loss=q_loss,
+            q_aux_alpha=q_aux_alpha,
+            q_freeze_backbone=q_freeze_backbone,
+        )
+        _tune_q_thresholds(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
+    else:
         if phase == "morph" and best_ckpt_path and best_ckpt_path.exists():
             if best_ckpt_path != ckpt_path:
                 shutil.copy2(best_ckpt_path, ckpt_path)

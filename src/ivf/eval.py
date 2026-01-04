@@ -64,6 +64,8 @@ def build_quality_dataset_from_df(
     normalize: bool = False,
     mean: Optional[list] = None,
     std: Optional[list] = None,
+    keep_unlabeled: bool = False,
+    extra_meta_cols: Optional[List[str]] = None,
 ) -> BaseImageDataset:
     quality_col = config.get("quality_col")
     day_col = config.get("day_col")
@@ -75,6 +77,7 @@ def build_quality_dataset_from_df(
 
     records = []
     source_counts: Dict[str, int] = {}
+    extra_meta_cols = list(extra_meta_cols or [])
     for _, row in df.iterrows():
         label_value, source = resolve_quality_label(
             row,
@@ -84,7 +87,7 @@ def build_quality_dataset_from_df(
             allow_grade=allow_grade,
         )
         update_label_source_counts(source_counts, source)
-        if label_value is None:
+        if label_value is None and not keep_unlabeled:
             continue
 
         image_id = row.get(id_col)
@@ -92,12 +95,17 @@ def build_quality_dataset_from_df(
             image_id = row.get(image_col)
 
         targets = make_full_target_dict(quality=label_value)
+        quality_text = None
+        if label_value is not None:
+            quality_text = QualityLabel.GOOD.value if label_value == 1 else QualityLabel.POOR.value
         meta = {
             "id": image_id,
-            "dataset": "hungvuong",
-            "quality": QualityLabel.GOOD.value if label_value == 1 else QualityLabel.POOR.value,
+            "dataset": config.get("dataset_type", "hungvuong"),
+            "quality": quality_text,
             "label_source": source,
         }
+        for col in extra_meta_cols:
+            meta[col] = row.get(col)
         if day_col and day_col in df.columns:
             meta["day"] = row.get(day_col)
 

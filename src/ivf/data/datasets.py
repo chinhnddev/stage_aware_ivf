@@ -113,8 +113,8 @@ class BaseImageDataset(Dataset):
 
 
 IGNORE_INDEX = -1
-TARGET_KEYS = ("exp", "icm", "te", "stage", "quality")
-MASK_KEYS = ("exp_mask", "icm_mask", "te_mask")
+TARGET_KEYS = ("exp", "icm", "te", "stage", "quality", "q")
+MASK_KEYS = ("exp_mask", "icm_mask", "te_mask", "q_mask")
 
 
 def make_full_target_dict(
@@ -123,9 +123,11 @@ def make_full_target_dict(
     te=None,
     stage=None,
     quality=None,
+    q=None,
     exp_mask: Optional[int] = None,
     icm_mask: Optional[int] = None,
     te_mask: Optional[int] = None,
+    q_mask: Optional[int] = None,
 ) -> MutableMapping:
     """
     Ensure each sample has a full target dict so batching works across tasks.
@@ -142,9 +144,11 @@ def make_full_target_dict(
         "te": IGNORE_INDEX if te is None else te,
         "stage": IGNORE_INDEX if stage is None else stage,
         "quality": IGNORE_INDEX if quality is None else quality,
+        "q": IGNORE_INDEX if q is None else q,
         "exp_mask": _mask_value(exp_mask, exp),
         "icm_mask": _mask_value(icm_mask, icm),
         "te_mask": _mask_value(te_mask, te),
+        "q_mask": _mask_value(q_mask, q),
     }
 
 
