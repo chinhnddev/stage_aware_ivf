@@ -74,7 +74,7 @@ class LossConfig:
 class TrainingConfig:
     lr: float = 0.001
     weight_decay: float = 0.0001
-    epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10, "q": 10})
+    epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10, "q": 10, "baseline": 10})
     loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0, "q": 1.0})
     morph_loss_reduction: str = "mean"
     morph_labeled_oversample_ratio: float = 0.5
@@ -124,6 +124,22 @@ class QualityExpConfig:
 
 
 @dataclass
+class BaselineBinaryConfig:
+    dataset_config: str = "configs/data/target.yaml"
+    split_dir: Optional[str] = None
+    split_files: Dict[str, str] = field(default_factory=lambda: {"train": "", "val": "", "test": ""})
+    label_cols: List[str] = field(default_factory=lambda: ["quality", "quality_label", "label"])
+    group_col: Optional[str] = None
+    group_col_candidates: List[str] = field(default_factory=lambda: ["patient_id", "cycle_id", "embryo_id"])
+    backbone: str = "convnext_mini"
+    head: str = "linear"
+    mlp_hidden: int = 256
+    dropout: float = 0.0
+    pos_weight: Optional[float] = None
+    monitor_metric: str = "val/auprc"
+
+
+@dataclass
 class ExperimentConfig:
     seed: int = 42
     batch_size: int = 16
@@ -136,4 +152,5 @@ class ExperimentConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     outputs: OutputConfig = field(default_factory=OutputConfig)
     quality_exp: QualityExpConfig = field(default_factory=QualityExpConfig)
+    baseline: BaselineBinaryConfig = field(default_factory=BaselineBinaryConfig)
     base_config: Optional[str] = None

@@ -253,6 +253,35 @@ def _metrics_block(prob_good, y_true, days, threshold: float | None = None):
     return overall, day3, day5
 
 
+def _binary_metrics(y_true, y_pred) -> Dict[str, Optional[float]]:
+    if not y_true:
+        return {"f1": None, "acc": None, "precision": None, "recall": None}
+    y = np.array(y_true, dtype=int)
+    p = np.array(y_pred, dtype=int)
+    acc = float((p == y).mean()) if len(y) else None
+    tp = int(((p == 1) & (y == 1)).sum())
+    fp = int(((p == 1) & (y == 0)).sum())
+    fn = int(((p == 0) & (y == 1)).sum())
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    denom = (2 * tp + fp + fn)
+    f1 = (2 * tp / denom) if denom > 0 else 0.0
+    return {"f1": f1, "acc": acc, "precision": precision, "recall": recall}
+
+
+def _binary_metrics_block(y_true, y_pred, days) -> Dict[str, Dict[str, Optional[float]]]:
+    overall = _binary_metrics(y_true, y_pred)
+    day3_true = [y for y, d in zip(y_true, days) if d == 3]
+    day3_pred = [p for p, d in zip(y_pred, days) if d == 3]
+    day5_true = [y for y, d in zip(y_true, days) if d == 5]
+    day5_pred = [p for p, d in zip(y_pred, days) if d == 5]
+    return {
+        "overall": overall,
+        "day3": _binary_metrics(day3_true, day3_pred),
+        "day5": _binary_metrics(day5_true, day5_pred),
+    }
+
+
 def _predict_q(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -838,6 +867,44 @@ def main():
         }
 
         labeled_test = _filter_binary_preds(q_preds_test)
+        labeled_val = _filter_binary_preds(q_preds_val)
+        thresholds = _load_q_thresholds(output_dir, logger)
+        threshold_source = None
+        if isinstance(thresholds.get("global"), dict):
+            threshold_source = thresholds["global"].get("threshold")
+        if threshold_source is None:
+            threshold_source = 0.5
+            logger.warning("Q source threshold missing; using 0.5 for zero-shot.")
+        threshold_source = float(threshold_source)
+
+        threshold_calibrated = threshold_source
+        calibrated_block = {"method": "none", "threshold": threshold_calibrated, "stage": args.calibrate_stage, "f1_val": None}
+        if args.calibrate_mode != "none" and labeled_val["y_true"]:
+            cal_scores, cal_true = _select_calibration_subset(
+                labeled_val["q_score"],
+                labeled_val["y_true"],
+                labeled_val["day"],
+                args.calibrate_stage,
+            )
+            if not cal_scores:
+                logger.warning("Q calibration subset is empty; skipping calibration.")
+            else:
+                tuned_thresh, tuned_f1 = _tune_threshold(cal_scores, cal_true)
+                if tuned_thresh is not None:
+                    threshold_calibrated = float(tuned_thresh)
+                    calibrated_block = {
+                        "method": "threshold",
+                        "threshold": threshold_calibrated,
+                        "stage": args.calibrate_stage,
+                        "f1_val": tuned_f1,
+                    }
+        else:
+            if args.calibrate_mode != "none":
+                logger.warning("No binary labels for Q calibration; skipping calibration.")
+
+        pred_bin_source_all = [1 if score >= threshold_source else 0 for score in q_preds_test["q_score"]]
+        pred_bin_calib_all = [1 if score >= threshold_calibrated else 0 for score in q_preds_test["q_score"]]
+
         if labeled_test["y_true"]:
             q_overall = compute_metrics(labeled_test["q_score"], labeled_test["y_true"])
             q_day3_probs, q_day3_true = slice_by_day(
@@ -848,70 +915,52 @@ def main():
                 {"prob_good": labeled_test["q_score"], "y_true": labeled_test["y_true"], "day": labeled_test["day"]},
                 5,
             )
-            q_day3 = compute_metrics(q_day3_probs, q_day3_true)
-            q_day5 = compute_metrics(q_day5_probs, q_day5_true)
-            q_metrics["binary"] = {
-                "overall": q_overall,
-                "day3": q_day3,
-                "day5": q_day5,
+            q_day3_rank = compute_metrics(q_day3_probs, q_day3_true)
+            q_day5_rank = compute_metrics(q_day5_probs, q_day5_true)
+            q_metrics["binary_rank"] = {
+                "overall": {"auroc": q_overall.get("auroc"), "auprc": q_overall.get("auprc")},
+                "day3": {"auroc": q_day3_rank.get("auroc"), "auprc": q_day3_rank.get("auprc")},
+                "day5": {"auroc": q_day5_rank.get("auroc"), "auprc": q_day5_rank.get("auprc")},
             }
 
-            thresholds = _load_q_thresholds(output_dir, logger)
-            global_thresh = None
-            if isinstance(thresholds.get("global"), dict):
-                global_thresh = thresholds["global"].get("threshold")
+            labels_labeled = []
+            pred_source_labeled = []
+            pred_calib_labeled = []
+            days_labeled = []
+            for score, label, day in zip(q_preds_test["q_score"], q_preds_test["y_true"], q_preds_test["day"]):
+                if label is None:
+                    continue
+                labels_labeled.append(int(label))
+                pred_source_labeled.append(1 if score >= threshold_source else 0)
+                pred_calib_labeled.append(1 if score >= threshold_calibrated else 0)
+                days_labeled.append(day)
 
-            def _pick_threshold(domain, day):
-                by_domain = thresholds.get("by_domain", {})
-                by_stage = thresholds.get("by_stage", {})
-                if domain and isinstance(by_domain, dict) and domain in by_domain:
-                    return by_domain[domain].get("threshold")
-                if day is not None and isinstance(by_stage, dict) and str(day) in by_stage:
-                    return by_stage[str(day)].get("threshold")
-                return global_thresh
+            zero_block = _binary_metrics_block(labels_labeled, pred_source_labeled, days_labeled)
+            calib_block = _binary_metrics_block(labels_labeled, pred_calib_labeled, days_labeled)
+            q_metrics["zero_shot"] = {"threshold_source": threshold_source, **zero_block}
+            q_metrics["calibrated"] = {**calibrated_block, **calib_block}
 
-            def _threshold_metrics(scores, labels, days, domains):
-                if not scores:
-                    return {"f1": None, "acc": None}
-                preds = []
-                for score, day_val, domain in zip(scores, days, domains):
-                    thresh = _pick_threshold(domain, day_val)
-                    if thresh is None:
-                        thresh = 0.5
-                    preds.append(1 if score >= thresh else 0)
-                y = np.array(labels)
-                p = np.array(preds)
-                acc = float((p == y).mean()) if len(y) else None
-                tp = int(((p == 1) & (y == 1)).sum())
-                fp = int(((p == 1) & (y == 0)).sum())
-                fn = int(((p == 0) & (y == 1)).sum())
-                denom = (2 * tp + fp + fn)
-                f1 = (2 * tp / denom) if denom > 0 else 0.0
-                return {"f1": f1, "acc": acc}
-
-            q_thresh_overall = _threshold_metrics(
-                labeled_test["q_score"],
-                labeled_test["y_true"],
-                labeled_test["day"],
-                labeled_test["domain"],
+            logger.info(
+                "Q zero-shot threshold=%.4f metrics: %s",
+                threshold_source,
+                q_metrics["zero_shot"],
             )
-            day3_domains = [d for d, day in zip(labeled_test["domain"], labeled_test["day"]) if day == 3]
-            day5_domains = [d for d, day in zip(labeled_test["domain"], labeled_test["day"]) if day == 5]
-            q_thresh_day3 = _threshold_metrics(q_day3_probs, q_day3_true, [3] * len(q_day3_probs), day3_domains)
-            q_thresh_day5 = _threshold_metrics(q_day5_probs, q_day5_true, [5] * len(q_day5_probs), day5_domains)
-
-            q_metrics["thresholded"] = {
-                "overall": q_thresh_overall,
-                "day3": q_thresh_day3,
-                "day5": q_thresh_day5,
-            }
-        elif proxy_test_targets:
+            logger.info(
+                "Q calibrated threshold=%.4f metrics: %s",
+                threshold_calibrated,
+                q_metrics["calibrated"],
+            )
+        else:
+            logger.warning("No binary labels for Q eval; skipping decision metrics.")
+            q_metrics["zero_shot"] = {"threshold_source": threshold_source, "overall": None, "day3": None, "day5": None}
+            q_metrics["calibrated"] = {**calibrated_block, "overall": None, "day3": None, "day5": None}
+        if proxy_test_targets:
             if proxy_val_targets:
                 derived_threshold = float(np.median(proxy_val_targets))
-                threshold_source = "val_median"
+                derived_source = "val_median"
             else:
                 derived_threshold = float(np.median(proxy_test_targets))
-                threshold_source = "test_median"
+                derived_source = "test_median"
 
             derived_scores = []
             derived_labels = []
@@ -934,10 +983,16 @@ def main():
             )
             q_metrics["proxy_binary"] = {
                 "threshold": derived_threshold,
-                "threshold_source": threshold_source,
-                "overall": proxy_overall,
-                "day3": compute_metrics(proxy_day3_probs, proxy_day3_true),
-                "day5": compute_metrics(proxy_day5_probs, proxy_day5_true),
+                "threshold_source": derived_source,
+                "overall": {"auroc": proxy_overall.get("auroc"), "auprc": proxy_overall.get("auprc")},
+                "day3": {
+                    "auroc": compute_metrics(proxy_day3_probs, proxy_day3_true).get("auroc"),
+                    "auprc": compute_metrics(proxy_day3_probs, proxy_day3_true).get("auprc"),
+                },
+                "day5": {
+                    "auroc": compute_metrics(proxy_day5_probs, proxy_day5_true).get("auroc"),
+                    "auprc": compute_metrics(proxy_day5_probs, proxy_day5_true).get("auprc"),
+                },
             }
         q_metrics_path = output_dir / "external_q_metrics.json"
         with open(q_metrics_path, "w", encoding="utf-8") as f:
@@ -945,7 +1000,10 @@ def main():
 
         q_preds_path = output_dir / "external_q_predictions.csv"
         with open(q_preds_path, "w", encoding="utf-8") as f:
-            f.write("image_id,domain,stage,q_score,label_binary,exp_gt,icm_gt,te_gt,gardner_raw,q_proxy_external,q_proxy_source\n")
+            f.write(
+                "image_id,domain,stage,q_score,label_binary,exp_gt,icm_gt,te_gt,gardner_raw,q_proxy_external,q_proxy_source,"
+                "pred_bin_source,pred_bin_calibrated,threshold_source_used,threshold_calibrated_used\n"
+            )
             for idx, (image_id, score, label, day_val, domain) in enumerate(
                 zip(
                     q_preds_test["image_id"],
@@ -972,8 +1030,13 @@ def main():
                 gardner_str = "" if gardner_raw is None else str(gardner_raw)
                 proxy_str = "" if q_proxy_val is None else f"{q_proxy_val:.6f}"
                 source_str = "" if q_source is None else str(q_source)
+                pred_source = pred_bin_source_all[idx] if idx < len(pred_bin_source_all) else ""
+                pred_calib = pred_bin_calib_all[idx] if idx < len(pred_bin_calib_all) else ""
+                thresh_source_str = f"{threshold_source:.6f}" if threshold_source is not None else ""
+                thresh_calib_str = f"{threshold_calibrated:.6f}" if threshold_calibrated is not None else ""
                 f.write(
-                    f"{image_id},{dom},{stage},{score:.6f},{label_str},{exp_str},{icm_str},{te_str},{gardner_str},{proxy_str},{source_str}\n"
+                    f"{image_id},{dom},{stage},{score:.6f},{label_str},{exp_str},{icm_str},{te_str},{gardner_str},"
+                    f"{proxy_str},{source_str},{pred_source},{pred_calib},{thresh_source_str},{thresh_calib_str}\n"
                 )
 
         logger.info("Saved q metrics to %s", q_metrics_path)
