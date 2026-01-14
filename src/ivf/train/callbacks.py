@@ -3,6 +3,7 @@ Training callbacks for lightweight progress logging.
 """
 
 from pathlib import Path
+import math
 import sys
 import time
 from typing import Optional
@@ -129,14 +130,20 @@ class BestMetricCheckpoint(pl.Callback):
             value = metrics[self.primary_metric]
             try:
                 score = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
-                return self.primary_metric, score, self.primary_mode
+                if not math.isfinite(score):
+                    score = None
+                if score is not None:
+                    return self.primary_metric, score, self.primary_mode
             except (TypeError, ValueError):
                 pass
         if self.fallback_metric in metrics:
             value = metrics[self.fallback_metric]
             try:
                 score = float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
-                return self.fallback_metric, score, self.fallback_mode
+                if not math.isfinite(score):
+                    score = None
+                if score is not None:
+                    return self.fallback_metric, score, self.fallback_mode
             except (TypeError, ValueError):
                 pass
         return None, None, None

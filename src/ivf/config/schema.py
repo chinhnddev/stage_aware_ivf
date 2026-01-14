@@ -8,10 +8,18 @@ from typing import Dict, List, Optional
 
 @dataclass
 class EncoderConfig:
+    name: str = "convnext_mini"
     in_channels: int = 3
     dims: List[int] = field(default_factory=lambda: [32, 64, 128])
     feature_dim: int = 256
     weights_path: Optional[str] = None
+    width_mult: float = 1.0
+    use_head_conv: bool = True
+    norm: str = "bn"
+    gn_groups: int = 8
+    drop_path_rate: float = 0.05
+    se_ratio: float = 0.25
+    stages: Optional[List[Dict[str, int]]] = None
 
 
 @dataclass
@@ -63,6 +71,20 @@ class MorphTrainingConfig:
     class_weight_mode: str = "inverse_freq"
     balance_icm_te: bool = False
     labeled_mix_ratio: float = 0.5
+    use_weighted_sampler: bool = False
+    sampler_target: str = "te"
+    monitor_metric: str = "val/te_macro_f1"
+    monitor_fallback_metric: str = "val/te_bal_acc"
+
+
+@dataclass
+class QualityTrainingConfig:
+    warmup_epochs: int = 0
+    unfreeze_ratio: float = 0.0
+    unfreeze_last_n_blocks: int = 0
+    head_lr: Optional[float] = None
+    encoder_lr_scale: float = 0.1
+    early_stop_patience: int = 0
 
 
 @dataclass
@@ -80,6 +102,7 @@ class TrainingConfig:
     morph_labeled_oversample_ratio: float = 0.5
     loss: LossConfig = field(default_factory=LossConfig)
     morph: MorphTrainingConfig = field(default_factory=MorphTrainingConfig)
+    quality: QualityTrainingConfig = field(default_factory=QualityTrainingConfig)
     q: "QTrainingConfig" = field(default_factory=lambda: QTrainingConfig())
     joint_sampling: str = "balanced"
     quality_sampling: str = "proportional"
@@ -107,6 +130,7 @@ class OutputConfig:
     checkpoints_dir: str = "outputs/checkpoints"
     logs_dir: str = "outputs/logs"
     reports_dir: str = "outputs/reports"
+    checkpoint_paths: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

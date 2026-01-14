@@ -213,6 +213,46 @@ def _log_morphology_train_stats(records: list, context: str) -> None:
             )
 
 
+def _log_morphology_effective_counts(records: list, context: str) -> None:
+    logger = get_logger("ivf")
+    exp_counts = {exp: 0 for exp in EXPANSION_CLASSES}
+    icm_counts = {cls: 0 for cls in ICM_CLASSES}
+    te_counts = {cls: 0 for cls in TE_CLASSES}
+    exp_total = 0
+    icm_total = 0
+    te_total = 0
+
+    for record in records:
+        targets = record.get("targets", {})
+        exp_mask = targets.get("exp_mask", 0)
+        exp_label = targets.get("exp", IGNORE_INDEX)
+        if exp_mask and exp_label is not None and exp_label >= 0 and exp_label < len(EXPANSION_CLASSES):
+            exp_counts[EXPANSION_CLASSES[int(exp_label)]] += 1
+            exp_total += 1
+
+        for head, classes, counts in (("icm", ICM_CLASSES, icm_counts), ("te", TE_CLASSES, te_counts)):
+            mask = targets.get(f"{head}_mask", 0)
+            if not mask:
+                continue
+            label = targets.get(head, IGNORE_INDEX)
+            if label is None:
+                continue
+            try:
+                label_int = int(label)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= label_int < len(classes):
+                counts[classes[label_int]] += 1
+                if head == "icm":
+                    icm_total += 1
+                else:
+                    te_total += 1
+
+    logger.info("%s labeled counts: exp=%s icm=%s te=%s", context, exp_total, icm_total, te_total)
+    logger.info("%s exp true counts: %s", context, exp_counts)
+    logger.info("%s icm true counts: %s", context, icm_counts)
+    logger.info("%s te true counts: %s", context, te_counts)
+
 def _build_morphology_records(
     df: pd.DataFrame,
     include_meta_day: bool,
@@ -568,6 +608,8 @@ class IVFDataModule(pl.LightningDataModule):
         morph_labeled_oversample_ratio: float = 0.5,
         morph_balance_icm_te: bool = False,
         morph_labeled_mix_ratio: float = 0.5,
+        morph_use_weighted_sampler: bool = False,
+        morph_sampler_target: str = "te",
         q_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         super().__init__()
@@ -588,6 +630,8 @@ class IVFDataModule(pl.LightningDataModule):
         self.morph_labeled_oversample_ratio = morph_labeled_oversample_ratio
         self.morph_balance_icm_te = morph_balance_icm_te
         self.morph_labeled_mix_ratio = morph_labeled_mix_ratio
+        self.morph_use_weighted_sampler = morph_use_weighted_sampler
+        self.morph_sampler_target = morph_sampler_target
         self.q_weights = q_weights
         self.morph_labeled_idx = []
         self.morph_icm_counts = None
@@ -602,6 +646,8 @@ class IVFDataModule(pl.LightningDataModule):
             raise ValueError("morph_labeled_oversample_ratio must be in [0,1].")
         if not 0 <= self.morph_labeled_mix_ratio <= 1:
             raise ValueError("morph_labeled_mix_ratio must be in [0,1].")
+        if self.morph_sampler_target not in {"te", "icm", "both"}:
+            raise ValueError("morph_sampler_target must be one of {'te', 'icm', 'both'}.")
 
         self.train_dataset = None
         self.val_dataset = None
@@ -756,22 +802,25 @@ class IVFDataModule(pl.LightningDataModule):
             self.morph_sample_info = sample_info
             logger.info("Morph labeled_idx size=%s", len(labeled_idx))
             _log_morphology_train_stats(morph_train_records, context="morph_train")
+            _log_morphology_effective_counts(morph_train_records, context="Train")
             self.train_dataset = BaseImageDataset(
                 morph_train_records,
                 transform=train_tf,
                 include_meta_day=self.include_meta_day,
                 root_dir=self._root_dir("blastocyst"),
             )
+            morph_val_records = _build_morphology_records(
+                val_df,
+                self.include_meta_day,
+                context="morph_val",
+            )
             self.val_dataset = BaseImageDataset(
-                _build_morphology_records(
-                    val_df,
-                    self.include_meta_day,
-                    context="morph_val",
-                ),
+                morph_val_records,
                 transform=eval_tf,
                 include_meta_day=self.include_meta_day,
                 root_dir=self._root_dir("blastocyst"),
             )
+            _log_morphology_effective_counts(morph_val_records, context="Val")
             logger.info("Morphology train size=%s val size=%s", len(self.train_dataset), len(self.val_dataset))
         elif self.phase == "stage":
             train_df = _load_split_df(self.splits["humanembryo2"], "train")
@@ -958,7 +1007,76 @@ class IVFDataModule(pl.LightningDataModule):
             labeled = len(self.morph_labeled_idx)
             unlabeled = total - labeled
             if labeled > 0 and unlabeled > 0:
-                if self.morph_balance_icm_te and 0 < self.morph_labeled_mix_ratio < 1:
+                if self.morph_use_weighted_sampler:
+                    if self.morph_balance_icm_te or (0 < self.morph_labeled_oversample_ratio < 1):
+                        get_logger("ivf").info(
+                            "Morph weighted sampler enabled; ignoring morph_balance_icm_te and oversample_ratio."
+                        )
+
+                    def _class_weights(counts_tensor: Optional[torch.Tensor]):
+                        if counts_tensor is None:
+                            return None
+                        num_classes = 2 if int(counts_tensor[2].item()) == 0 else 3
+                        head_counts = counts_tensor[:num_classes].float()
+                        total_head = head_counts.sum().item()
+                        if total_head <= 0:
+                            return None
+                        weights = torch.zeros_like(head_counts)
+                        for i, count in enumerate(head_counts):
+                            if count > 0:
+                                weights[i] = total_head / (num_classes * count)
+                        nonzero = weights[weights > 0]
+                        if nonzero.numel() > 0:
+                            weights = weights / nonzero.mean()
+                        return weights
+
+                    icm_weights = _class_weights(self.morph_icm_counts) if self.morph_sampler_target in {"icm", "both"} else None
+                    te_weights = _class_weights(self.morph_te_counts) if self.morph_sampler_target in {"te", "both"} else None
+                    if icm_weights is None and te_weights is None:
+                        get_logger("ivf").warning(
+                            "Morph weighted sampler requested but no labeled counts found for target=%s; skipping.",
+                            self.morph_sampler_target,
+                        )
+                    else:
+                        ratio = self.morph_labeled_mix_ratio if 0 < self.morph_labeled_mix_ratio < 1 else 0.5
+                        w_labeled = (ratio * unlabeled) / ((1.0 - ratio) * labeled)
+                        labeled_set = set(self.morph_labeled_idx)
+                        weights = []
+                        for idx in range(total):
+                            if idx not in labeled_set:
+                                weights.append(1.0)
+                                continue
+                            info = self.morph_sample_info[idx] if idx < len(self.morph_sample_info) else {}
+                            parts = []
+                            if icm_weights is not None and info.get("icm_mask") and isinstance(info.get("icm_label"), int):
+                                label = info.get("icm_label")
+                                if 0 <= label < len(icm_weights):
+                                    parts.append(float(icm_weights[label]))
+                            if te_weights is not None and info.get("te_mask") and isinstance(info.get("te_label"), int):
+                                label = info.get("te_label")
+                                if 0 <= label < len(te_weights):
+                                    parts.append(float(te_weights[label]))
+                            weight_factor = sum(parts) / len(parts) if parts else 1.0
+                            weights.append(w_labeled * weight_factor)
+
+                        if any(weight > 0 for weight in weights):
+                            generator = torch.Generator()
+                            generator.manual_seed(torch.initial_seed())
+                            sampler = WeightedRandomSampler(
+                                weights,
+                                num_samples=total,
+                                replacement=True,
+                                generator=generator,
+                            )
+                            shuffle = False
+                            get_logger("ivf").info(
+                                "Morph weighted sampler target=%s labeled=%s total=%s mix_ratio=%.2f",
+                                self.morph_sampler_target,
+                                labeled,
+                                total,
+                                ratio,
+                            )
+                elif self.morph_balance_icm_te and 0 < self.morph_labeled_mix_ratio < 1:
                     ratio = self.morph_labeled_mix_ratio
                     w_labeled = (ratio * unlabeled) / ((1.0 - ratio) * labeled)
                     labeled_set = set(self.morph_labeled_idx)

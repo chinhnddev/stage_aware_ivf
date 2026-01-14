@@ -1,0 +1,31 @@
+name: embryonet_lite
+in_channels: 3
+feature_dim: 512
+use_head_conv: true
+width_mult: 1.0
+norm: bn
+gn_groups: 8
+drop_path_rate: 0.05
+se_ratio: 0.25
+stages:
+  - out_channels: 32
+    kernel: 3
+    stride: 1
+    repeats: 2
+    expand: 2
+  - out_channels: 64
+    kernel: 5
+    stride: 2
+    repeats: 3
+    expand: 4
+  - out_channels: 128
+    kernel: 5
+    stride: 2
+    repeats: 4
+    expand: 4
+  - out_channels: 256
+    kernel: 3
+    stride: 2
+    repeats: 2
+    expand: 6
+weights_path: null

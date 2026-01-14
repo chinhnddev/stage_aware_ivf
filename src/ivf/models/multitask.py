@@ -28,6 +28,8 @@ class MultiTaskEmbryoNet(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = encoder if encoder is not None else ConvNeXtMini(feature_dim=feature_dim)
+        if hasattr(self.encoder, "out_dim"):
+            feature_dim = int(getattr(self.encoder, "out_dim"))
         self.morph = MorphologyHeads(feature_dim)
         self.stage = StageHead(feature_dim)
         self.q_head = nn.Sequential(

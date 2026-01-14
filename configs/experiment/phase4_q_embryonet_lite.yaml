@@ -1,0 +1,29 @@
+defaults:
+  - base
+  - overrides/encoder_embryonet_lite
+
+model:
+  heads:
+    quality_conditioning: none
+
+training:
+  epochs:
+    q: 10
+  loss_weights:
+    morph: 0.0
+    stage: 0.0
+    quality: 0.0
+    q: 1.0
+  q:
+    q_loss: smoothl1
+    q_weights:
+      exp: 0.4
+      icm: 0.3
+      te: 0.3
+    freeze_backbone: true
+    aux_alpha: 0.0
+    unfreeze_last_n_blocks: 0
+
+outputs:
+  checkpoint_paths:
+    q: outputs/checkpoints/phase2_stage.ckpt

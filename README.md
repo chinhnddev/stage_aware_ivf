@@ -15,8 +15,43 @@
 - Outputs: `{"features": f, "morph": {"exp":..., "icm":..., "te":...}, "stage":..., "quality":...}` with losses defined in `src/ivf/losses.py`.
 - Encoder initializes randomly by default; optional `weights_path` can load external weights, but no ImageNet-pretrained claim is made.
 
+## EmbryoNetLite (from scratch)
+- Lightweight MBConv+SE encoder trained from scratch (no pretrained weights).
+- Switch via config: set `model.encoder_config: configs/model/encoder_embryonet_lite.yaml`.
+- Phase reminders: morphology heads train only in Phase 1 (Day-5). Day-3 never uses morphology heads.
+
+Example YAML snippets per phase:
+```yaml
+# Phase 1 (morphology)
+model:
+  encoder_config: configs/model/encoder_embryonet_lite.yaml
+  heads:
+    quality_conditioning: none
+```
+```yaml
+# Phase 2 (stage)
+model:
+  encoder_config: configs/model/encoder_embryonet_lite.yaml
+```
+```yaml
+# Phase 3 (joint)
+model:
+  encoder_config: configs/model/encoder_embryonet_lite.yaml
+```
+```yaml
+# Phase 4 (quality)
+model:
+  encoder_config: configs/model/encoder_embryonet_lite.yaml
+```
+```yaml
+# Phase 4q (q-score)
+model:
+  encoder_config: configs/model/encoder_embryonet_lite.yaml
+```
+
 ## Training order & why
 - Phase 1 (morphology): learn EXP/ICM/TE on blastocysts with light augmentations; establishes morphology features.
+- Phase 1 checkpointing uses `val/te_macro_f1` (fallback `val/te_bal_acc`) to reduce class-collapse risk.
 - Phase 2 (stage): learn stage with medium augmentations; encoder progressively unfrozen for stage awareness.
 - Phase 3 (joint): light joint adaptation on blastocyst + HumanEmbryo2.0; balanced morphology/stage losses.
 - Phase 4 (quality): train only the morphology+stage-conditioned quality head; encoder, morphology, and stage heads frozen.

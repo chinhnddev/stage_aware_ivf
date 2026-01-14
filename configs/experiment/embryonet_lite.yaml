@@ -1,7 +1,4 @@
 defaults:
   - base
+  - overrides/encoder_embryonet_lite
   - overrides/morph_fix_icm_te
-
-model:
-  heads:
-    quality_conditioning: none

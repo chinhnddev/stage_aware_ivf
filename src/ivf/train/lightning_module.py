@@ -37,6 +37,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         q_loss: str = "smoothl1",
         q_aux_alpha: float = 0.0,
         q_freeze_backbone: bool = True,
+        quality_warmup_epochs: int = 0,
+        quality_unfreeze_ratio: float = 0.0,
+        quality_unfreeze_last_n_blocks: int = 0,
+        quality_head_lr: Optional[float] = None,
+        quality_encoder_lr_scale: float = 0.1,
         live_epoch_line: bool = False,
     ) -> None:
         super().__init__()
@@ -49,6 +54,7 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.loss_weights = dict(self.loss_weights)
             self.loss_weights["stage"] = 0.0
             self.loss_weights["quality"] = 0.0
+            self.loss_weights["q"] = 0.0
             get_logger("ivf").info("Morph phase: forcing stage/quality loss weights to 0.")
         self.freeze_config = freeze_config or {}
         self.morph_loss_reduction = morph_loss_reduction
@@ -58,6 +64,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.q_loss = q_loss
         self.q_aux_alpha = q_aux_alpha
         self.q_freeze_backbone = q_freeze_backbone
+        self.quality_warmup_epochs = int(quality_warmup_epochs)
+        self.quality_unfreeze_ratio = float(quality_unfreeze_ratio)
+        self.quality_unfreeze_last_n_blocks = int(quality_unfreeze_last_n_blocks)
+        self.quality_head_lr = quality_head_lr
+        self.quality_encoder_lr_scale = float(quality_encoder_lr_scale)
         self.live_epoch_line = live_epoch_line
         self._epoch_start_time = None
         self._val_pred_counts = None
@@ -66,6 +77,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         self._val_manual_total = None
         self._val_counts = None
         self._collapse_streak = {"icm": 0, "te": 0}
+        self._quality_confusion = None
         self.exp_class_weight = None
         self.icm_class_weight = None
         self.te_class_weight = None
@@ -96,64 +108,66 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["model"])
 
+    def _set_trainable(self, module: nn.Module, trainable: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = trainable
+
+    def _unfreeze_last_encoder_blocks(self, n_blocks: int) -> None:
+        logger = get_logger("ivf")
+        if n_blocks <= 0:
+            return
+        encoder = getattr(self.model, "encoder", None)
+        blocks = getattr(encoder, "blocks", None)
+        if blocks is None:
+            logger.warning("Encoder blocks not found; unfreeze_last_n_blocks ignored.")
+            return
+        for block in list(blocks)[-n_blocks:]:
+            self._set_trainable(block, True)
+        if hasattr(encoder, "proj"):
+            self._set_trainable(encoder.proj, True)
+
     def _apply_phase_freeze(self, initial: bool = False) -> None:
         logger = get_logger("ivf")
-        def _set_trainable(module: nn.Module, trainable: bool) -> None:
-            for p in module.parameters():
-                p.requires_grad = trainable
-
-        def _unfreeze_last_encoder_blocks(n_blocks: int) -> None:
-            if n_blocks <= 0:
-                return
-            encoder = getattr(self.model, "encoder", None)
-            blocks = getattr(encoder, "blocks", None)
-            if blocks is None:
-                logger.warning("Encoder blocks not found; q_unfreeze_last_n_blocks ignored.")
-                return
-            for block in list(blocks)[-n_blocks:]:
-                _set_trainable(block, True)
-            if hasattr(encoder, "proj"):
-                _set_trainable(encoder.proj, True)
 
         if self.phase == "morph":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, True)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, False)
+            self._set_trainable(self.model.encoder, True)
+            self._set_trainable(self.model.morph, True)
+            self._set_trainable(self.model.stage, False)
+            self._set_trainable(self.model.quality, False)
             logger.info("EXP-1 Morphology: encoder+morph trainable; stage+quality frozen.")
         elif self.phase == "stage":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, True)
-            _set_trainable(self.model.quality, False)
+            self._set_trainable(self.model.encoder, True)
+            self._set_trainable(self.model.morph, False)
+            self._set_trainable(self.model.stage, True)
+            self._set_trainable(self.model.quality, False)
             if initial:
                 freeze_ratio = self.freeze_config.get("stage_start_ratio", 0.8)
                 freeze_encoder(self.model, ratio=freeze_ratio)
                 logger.info("EXP-2 Stage-aware: initial freeze ratio=%s", freeze_ratio)
         elif self.phase == "joint":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, True)
-            _set_trainable(self.model.stage, True)
-            _set_trainable(self.model.quality, False)
+            self._set_trainable(self.model.encoder, True)
+            self._set_trainable(self.model.morph, True)
+            self._set_trainable(self.model.stage, True)
+            self._set_trainable(self.model.quality, False)
             logger.info("EXP-3 Joint stabilization: encoder+morph+stage trainable; quality frozen.")
         elif self.phase == "quality":
             freeze_encoder(self.model, ratio=1.0)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, True)
+            self._set_trainable(self.model.morph, False)
+            self._set_trainable(self.model.stage, False)
+            self._set_trainable(self.model.quality, True)
             logger.info("EXP-4 Quality: encoder+morph+stage frozen; quality trainable.")
         elif self.phase == "q":
             if self.q_freeze_backbone:
                 freeze_encoder(self.model, ratio=1.0)
             else:
-                _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, False)
-            _set_trainable(self.model.q_head, True)
+                self._set_trainable(self.model.encoder, True)
+            self._set_trainable(self.model.morph, False)
+            self._set_trainable(self.model.stage, False)
+            self._set_trainable(self.model.quality, False)
+            self._set_trainable(self.model.q_head, True)
             unfreeze_blocks = int(self.freeze_config.get("q_unfreeze_last_n_blocks", 0))
             if self.q_freeze_backbone and unfreeze_blocks > 0:
-                _unfreeze_last_encoder_blocks(unfreeze_blocks)
+                self._unfreeze_last_encoder_blocks(unfreeze_blocks)
                 logger.info("EXP-4Q: encoder frozen except last %s blocks; q_head trainable.", unfreeze_blocks)
             elif self.q_freeze_backbone:
                 logger.info("EXP-4Q: encoder+morph+stage+quality frozen; q_head trainable.")
@@ -169,6 +183,45 @@ class MultiTaskLightningModule(pl.LightningModule):
                 ratio = progressive_unfreeze(self.model, epoch=self.current_epoch, schedule=schedule)
                 self.log("train/freeze_ratio", ratio, on_epoch=True, prog_bar=False)
                 get_logger("ivf").info("Stage phase epoch %s: freeze ratio=%s", self.current_epoch, ratio)
+        if self.phase == "quality":
+            warmup_epochs = max(self.quality_warmup_epochs, 0)
+            if self.current_epoch < warmup_epochs:
+                freeze_encoder(self.model, ratio=1.0)
+                self._set_trainable(self.model.morph, False)
+                self._set_trainable(self.model.stage, False)
+                self._set_trainable(self.model.quality, True)
+                get_logger("ivf").info(
+                    "Quality warmup epoch %s/%s: encoder frozen; quality head trainable.",
+                    self.current_epoch + 1,
+                    warmup_epochs,
+                )
+            else:
+                self._set_trainable(self.model.morph, False)
+                self._set_trainable(self.model.stage, False)
+                self._set_trainable(self.model.quality, True)
+                if self.quality_unfreeze_last_n_blocks > 0:
+                    freeze_encoder(self.model, ratio=1.0)
+                    self._unfreeze_last_encoder_blocks(self.quality_unfreeze_last_n_blocks)
+                    get_logger("ivf").info(
+                        "Quality finetune epoch %s: encoder unfrozen last %s blocks.",
+                        self.current_epoch + 1,
+                        self.quality_unfreeze_last_n_blocks,
+                    )
+                elif self.quality_unfreeze_ratio > 0:
+                    freeze_ratio = max(0.0, min(1.0, 1.0 - self.quality_unfreeze_ratio))
+                    freeze_encoder(self.model, ratio=freeze_ratio)
+                    get_logger("ivf").info(
+                        "Quality finetune epoch %s: encoder unfreeze_ratio=%.2f (freeze_ratio=%.2f).",
+                        self.current_epoch + 1,
+                        self.quality_unfreeze_ratio,
+                        freeze_ratio,
+                    )
+                else:
+                    freeze_encoder(self.model, ratio=1.0)
+                    get_logger("ivf").info(
+                        "Quality finetune epoch %s: encoder frozen (no unfreeze config).",
+                        self.current_epoch + 1,
+                    )
         if not self.trainer or getattr(self.trainer, "sanity_checking", False):
             return
         self._epoch_start_time = time.time()
@@ -194,6 +247,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             self._val_manual_correct = {"icm": 0, "te": 0}
             self._val_manual_total = {"icm": 0, "te": 0}
             self._val_counts = {"exp": 0, "icm": 0, "te": 0}
+        if self.phase == "quality":
+            self._quality_confusion = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         if not self.trainer or getattr(self.trainer, "sanity_checking", False):
@@ -235,6 +290,18 @@ class MultiTaskLightningModule(pl.LightningModule):
             self._next_progress_pct += 25.0
 
     def configure_optimizers(self):
+        if self.phase == "quality" and self.quality_head_lr is not None:
+            head_lr = float(self.quality_head_lr)
+            encoder_lr = head_lr * self.quality_encoder_lr_scale
+            head_params = list(self.model.quality.parameters())
+            encoder_params = list(self.model.encoder.parameters())
+            return torch.optim.AdamW(
+                [
+                    {"params": head_params, "lr": head_lr},
+                    {"params": encoder_params, "lr": encoder_lr},
+                ],
+                weight_decay=self.weight_decay,
+            )
         params = [p for p in self.parameters() if p.requires_grad]
         return torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
 
@@ -568,6 +635,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                 for key, metric in self.quality_metrics.items():
                     metric.update(probs[mask], t[mask])
                     self.log(f"val/{key}", metric, on_epoch=True, prog_bar=False, batch_size=batch_size)
+                preds = (probs >= 0.5).long()
+                y_true = t.long()
+                if self._quality_confusion is not None:
+                    tp = int(((preds == 1) & (y_true == 1) & mask).sum().item())
+                    tn = int(((preds == 0) & (y_true == 0) & mask).sum().item())
+                    fp = int(((preds == 1) & (y_true == 0) & mask).sum().item())
+                    fn = int(((preds == 0) & (y_true == 1) & mask).sum().item())
+                    self._quality_confusion["tp"] += tp
+                    self._quality_confusion["tn"] += tn
+                    self._quality_confusion["fp"] += fp
+                    self._quality_confusion["fn"] += fn
 
         if self.phase == "q":
             q_target = targets["q"].float()
@@ -593,6 +671,18 @@ class MultiTaskLightningModule(pl.LightningModule):
             return
 
         metrics = self.trainer.callback_metrics if self.trainer else {}
+        quality_bal_acc = None
+        if self.phase == "quality" and self._quality_confusion is not None:
+            tp = self._quality_confusion["tp"]
+            tn = self._quality_confusion["tn"]
+            fp = self._quality_confusion["fp"]
+            fn = self._quality_confusion["fn"]
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+            tnr = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+            if tpr == tpr and tnr == tnr:
+                quality_bal_acc = 0.5 * (tpr + tnr)
+                device = getattr(self, "device", None) or torch.device("cpu")
+                self.log("val/quality_bal_acc", torch.tensor(quality_bal_acc, device=device), on_epoch=True, prog_bar=False)
 
         def _value(key):
             if key not in metrics:
@@ -631,6 +721,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             _append(parts, "val_auprc", "val/quality_auprc")
             _append(parts, "val_f1", "val/quality_f1")
             _append(parts, "val_acc", "val/quality_acc")
+            if quality_bal_acc is not None:
+                parts.append(f"val_bal_acc={quality_bal_acc:.4f}")
         if self.phase == "q":
             _append(parts, "val_q_rmse", "val/q_rmse")
             _append(parts, "val_q_mae", "val/q_mae")
@@ -724,6 +816,8 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()
+        if self.phase == "quality":
+            self._quality_confusion = None
 
     def _setup_morph_class_weights(self) -> None:
         if not self.trainer or not hasattr(self.trainer, "datamodule"):

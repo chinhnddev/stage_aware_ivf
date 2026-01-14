@@ -17,6 +17,7 @@ import torch
 import pandas as pd
 import numpy as np
 import random
+from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from torch.utils.data import ConcatDataset
 
@@ -38,7 +39,7 @@ from ivf.data.label_schema import (
     parse_gardner_components,
 )
 from ivf.data.splits import save_splits, split_by_group
-from ivf.models.encoder import ConvNeXtMini
+from ivf.models.encoder import build_encoder
 from ivf.models.multitask import MultiTaskEmbryoNet
 from ivf.eval import compute_metrics, predict
 from ivf.train.callbacks import BestMetricCheckpoint, StepProgressLogger
@@ -109,6 +110,39 @@ def _safe_load_checkpoint(lightning_module, ckpt_path: Path, logger) -> None:
             len(skipped),
             ", ".join(skipped[:3]),
         )
+
+
+def load_encoder_only_from_ckpt(lightning_module, ckpt_path: Path, logger) -> None:
+    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    current = lightning_module.state_dict()
+    prefix = "model.encoder."
+    encoder_keys = [key for key in state_dict.keys() if key.startswith(prefix)]
+    filtered = {}
+    skipped_shape = []
+    for key in encoder_keys:
+        value = state_dict[key]
+        if key in current and current[key].shape == value.shape:
+            filtered[key] = value
+        else:
+            skipped_shape.append(key)
+    lightning_module.load_state_dict(filtered, strict=False)
+    skipped_non_encoder = len(state_dict) - len(encoder_keys)
+    if encoder_keys:
+        logger.info(
+            "Loaded encoder-only checkpoint: loaded=%s skipped_encoder=%s skipped_non_encoder=%s.",
+            len(filtered),
+            len(encoder_keys) - len(filtered),
+            skipped_non_encoder,
+        )
+        if skipped_shape:
+            logger.warning(
+                "Encoder-only load skipped %s shape-mismatched keys (e.g., %s).",
+                len(skipped_shape),
+                ", ".join(skipped_shape[:3]),
+            )
+    else:
+        logger.warning("Encoder-only load found no encoder keys with prefix %s.", prefix)
 
 
 def _summarize_morph_counts(dataset):
@@ -642,7 +676,12 @@ def _derive_quality_labels(df: pd.DataFrame, logger) -> pd.DataFrame:
     te_vals = df["te"].apply(_coerce_quality_component)
     valid_mask = exp_vals.notna() & icm_vals.notna() & te_vals.notna()
     df = df.copy()
-    df["quality_label"] = np.nan
+    df["quality_label"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    if "quality" in df.columns:
+        if df["quality"].dtype != object:
+            df["quality"] = df["quality"].astype("object")
+    else:
+        df["quality"] = pd.Series([None] * len(df), dtype="object")
     good_mask = (exp_vals >= 3) & icm_vals.isin([1, 2]) & te_vals.isin([1, 2])
     df.loc[valid_mask, "quality_label"] = np.where(good_mask[valid_mask], 1, 0)
     df.loc[valid_mask, "quality"] = np.where(good_mask[valid_mask], "good", "poor")
@@ -819,10 +858,12 @@ def _ensure_quality_splits(quality_cfg, split_entry, seed: int, logger):
     if group_col and group_col in df.columns and df[group_col].notna().any():
         train_df, val_df, test_df = _split_grouped(df, group_col, train_ratio, val_ratio, test_ratio, seed)
         _assert_no_group_overlap([train_df, val_df, test_df], group_col)
+        logger.info("Quality split group leakage check: OK (group_col=%s).", group_col)
     else:
         if group_col:
             logger.warning("group_col=%s missing or empty; falling back to random split.", group_col)
         train_df, val_df, test_df = _split_random(df, train_ratio, val_ratio, test_ratio, seed)
+        logger.info("Quality split group leakage check: skipped (no valid group_col).")
     if train_df.empty or val_df.empty or (test_ratio > 0 and test_df.empty):
         raise ValueError("Quality split generation produced empty train/val/test splits.")
 
@@ -831,7 +872,7 @@ def _ensure_quality_splits(quality_cfg, split_entry, seed: int, logger):
         path.parent.mkdir(parents=True, exist_ok=True)
         split_df.to_csv(path, index=False)
         counts = split_df["quality_label"].value_counts(dropna=False).to_dict()
-        logger.info("Quality %s label distribution: %s", name, counts)
+        logger.info("Quality %s size=%s label distribution: %s", name, len(split_df), counts)
         if counts.get(1, 0) == 0:
             logger.warning("Quality %s split has zero positive samples.", name)
 
@@ -1021,15 +1062,11 @@ def _run_quality_test_eval(
 def build_model(cfg) -> MultiTaskEmbryoNet:
     model_cfg = cfg.model
     encoder_cfg = model_cfg.encoder
-    encoder = ConvNeXtMini(
-        in_channels=encoder_cfg.in_channels,
-        dims=encoder_cfg.dims,
-        feature_dim=encoder_cfg.feature_dim,
-        weights_path=encoder_cfg.weights_path,
-    )
+    encoder = build_encoder(encoder_cfg)
+    feature_dim = getattr(encoder, "out_dim", encoder_cfg.feature_dim)
     return MultiTaskEmbryoNet(
         encoder=encoder,
-        feature_dim=encoder_cfg.feature_dim,
+        feature_dim=feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
         quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
     )
@@ -1076,6 +1113,11 @@ def main():
     logger = configure_logging(logs_dir / "train.log")
     logger.info("Seed=%s", cfg.seed)
 
+    quality_ckpt_name = getattr(getattr(cfg, "quality_exp", None), "checkpoint_name", None) or "phase4_quality.ckpt"
+    quality_ckpt_path = Path(quality_ckpt_name)
+    quality_ckpt_name = quality_ckpt_path.name
+    quality_best_ckpt_name = f"{quality_ckpt_path.stem}_best{quality_ckpt_path.suffix}"
+
     if phase == "morph":
         prev_conditioning = getattr(cfg.model.heads, "quality_conditioning", "morph+stage")
         if prev_conditioning != "none":
@@ -1083,6 +1125,33 @@ def main():
         cfg.model.heads.quality_conditioning = "none"
 
     model = build_model(cfg)
+    encoder_cfg = cfg.model.encoder
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        raise RuntimeError("Model is missing encoder attribute.")
+    requested_name = getattr(encoder_cfg, "name", None)
+    actual_name = type(encoder).__name__
+    out_dim = getattr(encoder, "out_dim", None)
+    total_params = sum(p.numel() for p in encoder.parameters())
+    trainable_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    pretrained_status = "ENABLED" if getattr(encoder_cfg, "weights_path", None) else "DISABLED"
+    logger.info(
+        "ENCODER_SELECTED: %s (%s) out_dim=%s params=%s trainable=%s pretrained=%s",
+        requested_name,
+        actual_name,
+        out_dim,
+        total_params,
+        trainable_params,
+        pretrained_status,
+    )
+    if requested_name == "embryonet_lite" and actual_name != "EmbryoNetLite":
+        raise RuntimeError(
+            f"Config requests embryonet_lite but got {actual_name}. Check config overrides."
+        )
+    if requested_name == "convnext_mini" and actual_name != "ConvNeXtMini":
+        raise RuntimeError(
+            f"Config requests convnext_mini but got {actual_name}. Check config overrides."
+        )
     logger.info("Quality conditioning mode: %s", model.quality_conditioning)
     phase_cfg = cfg.training
     loss_weights = resolve_config_dict(phase_cfg.loss_weights)
@@ -1091,6 +1160,7 @@ def main():
         loss_weights.setdefault("morph", 1.0)
         loss_weights["stage"] = 0.0
         loss_weights["quality"] = 0.0
+        loss_weights["q"] = 0.0
         logger.info("Morph phase loss weights: %s", loss_weights)
     freeze_cfg = resolve_config_dict(phase_cfg.freeze)
     morph_cfg = getattr(phase_cfg, "morph", None)
@@ -1098,12 +1168,25 @@ def main():
     morph_class_weight_mode = str(getattr(morph_cfg, "class_weight_mode", "inverse_freq")) if morph_cfg is not None else "inverse_freq"
     morph_balance_icm_te = bool(getattr(morph_cfg, "balance_icm_te", False)) if morph_cfg is not None else False
     morph_labeled_mix_ratio = float(getattr(morph_cfg, "labeled_mix_ratio", 0.5)) if morph_cfg is not None else 0.5
+    morph_use_weighted_sampler = bool(getattr(morph_cfg, "use_weighted_sampler", False)) if morph_cfg is not None else False
+    morph_sampler_target = str(getattr(morph_cfg, "sampler_target", "te")) if morph_cfg is not None else "te"
+    morph_monitor_metric = str(getattr(morph_cfg, "monitor_metric", "val/te_macro_f1")) if morph_cfg is not None else "val/te_macro_f1"
+    morph_monitor_fallback = str(getattr(morph_cfg, "monitor_fallback_metric", "val/te_bal_acc")) if morph_cfg is not None else "val/te_bal_acc"
     q_cfg = getattr(phase_cfg, "q", None)
     q_loss = str(getattr(q_cfg, "q_loss", "smoothl1")) if q_cfg is not None else "smoothl1"
     q_weights = resolve_config_dict(getattr(q_cfg, "q_weights", None)) if q_cfg is not None else None
     q_aux_alpha = float(getattr(q_cfg, "aux_alpha", 0.0)) if q_cfg is not None else 0.0
     q_freeze_backbone = bool(getattr(q_cfg, "freeze_backbone", True)) if q_cfg is not None else True
     q_unfreeze_last_n_blocks = int(getattr(q_cfg, "unfreeze_last_n_blocks", 0)) if q_cfg is not None else 0
+    quality_cfg = getattr(phase_cfg, "quality", None)
+    quality_warmup_epochs = int(getattr(quality_cfg, "warmup_epochs", 0)) if quality_cfg is not None else 0
+    quality_unfreeze_ratio = float(getattr(quality_cfg, "unfreeze_ratio", 0.0)) if quality_cfg is not None else 0.0
+    quality_unfreeze_last_n_blocks = int(getattr(quality_cfg, "unfreeze_last_n_blocks", 0)) if quality_cfg is not None else 0
+    quality_head_lr = None
+    if quality_cfg is not None and getattr(quality_cfg, "head_lr", None) is not None:
+        quality_head_lr = float(getattr(quality_cfg, "head_lr"))
+    quality_encoder_lr_scale = float(getattr(quality_cfg, "encoder_lr_scale", 0.1)) if quality_cfg is not None else 0.1
+    quality_early_stop_patience = int(getattr(quality_cfg, "early_stop_patience", 0)) if quality_cfg is not None else 0
     if phase == "q" and q_unfreeze_last_n_blocks > 0:
         freeze_cfg = dict(freeze_cfg or {})
         freeze_cfg["q_unfreeze_last_n_blocks"] = q_unfreeze_last_n_blocks
@@ -1193,6 +1276,11 @@ def main():
         q_loss=q_loss,
         q_aux_alpha=q_aux_alpha,
         q_freeze_backbone=q_freeze_backbone,
+        quality_warmup_epochs=quality_warmup_epochs,
+        quality_unfreeze_ratio=quality_unfreeze_ratio,
+        quality_unfreeze_last_n_blocks=quality_unfreeze_last_n_blocks,
+        quality_head_lr=quality_head_lr,
+        quality_encoder_lr_scale=quality_encoder_lr_scale,
         live_epoch_line=args.live_epoch_line,
     )
 
@@ -1205,29 +1293,37 @@ def main():
             )
     if prev_ckpt is not None and prev_ckpt.exists():
         logger.info("Loading checkpoint weights from %s", prev_ckpt)
-        try:
-            lightning_module = MultiTaskLightningModule.load_from_checkpoint(
-                checkpoint_path=str(prev_ckpt),
-                model=model,
-                phase=phase,
-                lr=phase_cfg.lr,
-                weight_decay=phase_cfg.weight_decay,
-                loss_weights=loss_weights,
-                freeze_config=freeze_cfg,
-                morph_loss_reduction=phase_cfg.morph_loss_reduction,
-                quality_pos_weight=quality_pos_weight,
-                use_class_weights=morph_use_class_weights,
-                class_weight_mode=morph_class_weight_mode,
-                q_loss=q_loss,
-                q_aux_alpha=q_aux_alpha,
-                q_freeze_backbone=q_freeze_backbone,
-                strict=True,
-            )
-        except RuntimeError as exc:
-            logger.warning("Checkpoint load failed (%s); using safe load with shape filtering.", exc)
-            _safe_load_checkpoint(lightning_module, prev_ckpt, logger)
+        if phase == "quality":
+            load_encoder_only_from_ckpt(lightning_module, prev_ckpt, logger)
+        else:
+            try:
+                lightning_module = MultiTaskLightningModule.load_from_checkpoint(
+                    checkpoint_path=str(prev_ckpt),
+                    model=model,
+                    phase=phase,
+                    lr=phase_cfg.lr,
+                    weight_decay=phase_cfg.weight_decay,
+                    loss_weights=loss_weights,
+                    freeze_config=freeze_cfg,
+                    morph_loss_reduction=phase_cfg.morph_loss_reduction,
+                    quality_pos_weight=quality_pos_weight,
+                    use_class_weights=morph_use_class_weights,
+                    class_weight_mode=morph_class_weight_mode,
+                    q_loss=q_loss,
+                    q_aux_alpha=q_aux_alpha,
+                    q_freeze_backbone=q_freeze_backbone,
+                    strict=True,
+                )
+            except RuntimeError as exc:
+                logger.warning("Checkpoint load failed (%s); using safe load with shape filtering.", exc)
+                _safe_load_checkpoint(lightning_module, prev_ckpt, logger)
     elif prev_ckpt is not None and not prev_ckpt.exists():
         logger.warning("Previous checkpoint not found at %s; continuing with random initialization.", prev_ckpt)
+    if phase == "quality" and prev_ckpt is not None and prev_ckpt.exists():
+        logger.info(
+            "Phase 3 Quality init: loaded encoder only from %s; skipped heads: morph/stage/quality.",
+            prev_ckpt,
+        )
 
     transforms_cfg = cfg.transforms
     train_transform_level = getattr(transforms_cfg, phase)
@@ -1255,6 +1351,8 @@ def main():
         morph_labeled_oversample_ratio=float(getattr(phase_cfg, "morph_labeled_oversample_ratio", 0.5)),
         morph_balance_icm_te=morph_balance_icm_te,
         morph_labeled_mix_ratio=morph_labeled_mix_ratio,
+        morph_use_weighted_sampler=morph_use_weighted_sampler,
+        morph_sampler_target=morph_sampler_target,
         q_weights=q_weights,
     )
 
@@ -1323,14 +1421,14 @@ def main():
         callbacks.append(
             BestMetricCheckpoint(
                 ckpt_path=best_ckpt_path,
-                primary_metric="val/loss",
-                fallback_metric="val/exp_acc",
-                primary_mode="min",
+                primary_metric=morph_monitor_metric,
+                fallback_metric=morph_monitor_fallback,
+                primary_mode="max",
                 fallback_mode="max",
             )
         )
     if phase == "quality":
-        best_ckpt_path = checkpoints_dir / "phase4_quality.ckpt"
+        best_ckpt_path = checkpoints_dir / quality_best_ckpt_name
         callbacks.append(
             BestMetricCheckpoint(
                 ckpt_path=best_ckpt_path,
@@ -1340,6 +1438,14 @@ def main():
                 fallback_mode="min",
             )
         )
+        if quality_early_stop_patience > 0:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="val/quality_auprc",
+                    mode="max",
+                    patience=quality_early_stop_patience,
+                )
+            )
     if phase == "q":
         best_ckpt_path = checkpoints_dir / "phase4_q.ckpt"
         callbacks.append(
@@ -1371,13 +1477,19 @@ def main():
         "morph": "phase1_morph.ckpt",
         "stage": "phase2_stage.ckpt",
         "joint": "phase3_joint.ckpt",
-        "quality": "phase4_quality.ckpt",
+        "quality": quality_ckpt_name,
         "q": "phase4_q.ckpt",
     }[phase]
     ckpt_path = checkpoints_dir / ckpt_name
     if phase == "quality":
+        eval_ckpt_path = ckpt_path
         if best_ckpt_path and best_ckpt_path.exists():
-            ckpt_path = best_ckpt_path
+            eval_ckpt_path = best_ckpt_path
+            if best_ckpt_path != ckpt_path:
+                shutil.copy2(best_ckpt_path, ckpt_path)
+            logger.info("Saved BEST checkpoint: %s", best_ckpt_path)
+            if best_ckpt_path != ckpt_path:
+                logger.info("Saved BEST checkpoint copy to %s", ckpt_path)
         else:
             trainer.save_checkpoint(ckpt_path)
             logger.warning("Best checkpoint not found; saved LAST checkpoint to %s", ckpt_path)
@@ -1387,7 +1499,7 @@ def main():
 
         eval_device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
         eval_module = MultiTaskLightningModule.load_from_checkpoint(
-            checkpoint_path=str(ckpt_path),
+            checkpoint_path=str(eval_ckpt_path),
             model=model,
             phase=phase,
             lr=phase_cfg.lr,

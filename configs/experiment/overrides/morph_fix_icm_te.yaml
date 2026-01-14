@@ -1,0 +1,7 @@
+training:
+  morph:
+    labeled_mix_ratio: 0.8
+    use_weighted_sampler: true
+    sampler_target: te
+    monitor_metric: val/te_macro_f1
+    monitor_fallback_metric: val/te_bal_acc

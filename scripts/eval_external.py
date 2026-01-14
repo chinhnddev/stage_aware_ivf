@@ -8,6 +8,7 @@ Usage:
 import argparse
 import json
 import sys
+import hashlib
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -30,7 +31,7 @@ from ivf.data.label_schema import (
     q_proxy_from_components,
 )
 from ivf.eval import _normalize_day, build_quality_dataset_from_df, compute_metrics, predict, slice_by_day
-from ivf.models.encoder import ConvNeXtMini
+from ivf.models.encoder import build_encoder
 from ivf.models.multitask import MultiTaskEmbryoNet
 from ivf.utils.guardrails import assert_no_hungvuong_training
 from ivf.utils.logging import configure_logging
@@ -41,7 +42,11 @@ from ivf.utils.seed import set_global_seed
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate on external Hung Vuong dataset.")
     parser.add_argument("--config", default="configs/experiment/base.yaml", help="Experiment config path.")
-    parser.add_argument("--checkpoint", default=None, help="Optional path to phase4 checkpoint.")
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional path to quality checkpoint or backbone checkpoint for q_only.",
+    )
     parser.add_argument("--q_checkpoint", default=None, help="Optional path to phase4_q checkpoint.")
     parser.add_argument("--output-dir", default=None, help="Output directory for reports.")
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
@@ -58,6 +63,11 @@ def parse_args():
         choices=["predefined", "random"],
         default="predefined",
         help="Use predefined HV splits if available, otherwise random split.",
+    )
+    parser.add_argument(
+        "--allow_random_split",
+        action="store_true",
+        help="Allow falling back to random HV split when predefined splits are missing.",
     )
     parser.add_argument("--hv_val_ratio", type=float, default=0.2, help="Validation ratio for HV split.")
     parser.add_argument(
@@ -87,21 +97,22 @@ def parse_args():
         action="store_true",
         help="Also evaluate q head and write external_q_metrics.json.",
     )
+    parser.add_argument(
+        "--q_only",
+        action="store_true",
+        help="Skip quality evaluation and run q-score evaluation only.",
+    )
     return parser.parse_args()
 
 
 def build_model(cfg) -> MultiTaskEmbryoNet:
     model_cfg = cfg.model
     encoder_cfg = model_cfg.encoder
-    encoder = ConvNeXtMini(
-        in_channels=encoder_cfg.in_channels,
-        dims=encoder_cfg.dims,
-        feature_dim=encoder_cfg.feature_dim,
-        weights_path=encoder_cfg.weights_path,
-    )
+    encoder = build_encoder(encoder_cfg)
+    feature_dim = getattr(encoder, "out_dim", encoder_cfg.feature_dim)
     return MultiTaskEmbryoNet(
         encoder=encoder,
-        feature_dim=encoder_cfg.feature_dim,
+        feature_dim=feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
         quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
     )
@@ -213,6 +224,14 @@ def _split_external_df(df: pd.DataFrame, id_col: str, val_ratio: float, seed: in
     return val_df, test_df
 
 
+def _split_ids(df: pd.DataFrame, id_col: Optional[str]) -> list[str]:
+    if id_col and id_col in df.columns:
+        return df[id_col].astype(str).fillna("").tolist()
+    if "image_path" in df.columns:
+        return df["image_path"].astype(str).fillna("").tolist()
+    return df.index.astype(str).tolist()
+
+
 def _load_predefined_splits(hung_cfg, df: pd.DataFrame):
     split_files = hung_cfg.get("split_files")
     if split_files:
@@ -226,6 +245,41 @@ def _load_predefined_splits(hung_cfg, df: pd.DataFrame):
         test_df = df[df["split"].astype(str).str.lower().isin({"test", "holdout"})].copy()
         return val_df, test_df
     return None, None
+
+
+def load_predefined_hv_splits(hung_cfg, df: pd.DataFrame, splits_base_dir: str, logger):
+    split_files = hung_cfg.get("split_files")
+    if split_files:
+        val_path = Path(split_files.get("val", ""))
+        test_path = Path(split_files.get("test", ""))
+        if val_path.exists() and test_path.exists():
+            logger.info("Using HV predefined splits from config: val=%s test=%s", val_path, test_path)
+            val_df = pd.read_csv(val_path)
+            test_df = pd.read_csv(test_path)
+            return val_df, test_df, (val_path, test_path)
+        logger.warning(
+            "HV split_files configured but missing: val=%s test=%s",
+            val_path,
+            test_path,
+        )
+
+    standard_dir = Path(splits_base_dir) / "hungvuong"
+    val_path = standard_dir / "val.csv"
+    test_path = standard_dir / "test.csv"
+    if val_path.exists() and test_path.exists():
+        logger.info("Using HV predefined splits from %s", standard_dir)
+        val_df = pd.read_csv(val_path)
+        test_df = pd.read_csv(test_path)
+        return val_df, test_df, (val_path, test_path)
+
+    if "split" in df.columns:
+        val_df = df[df["split"].astype(str).str.lower().isin({"val", "valid", "validation"})].copy()
+        test_df = df[df["split"].astype(str).str.lower().isin({"test", "holdout"})].copy()
+        if not val_df.empty and not test_df.empty:
+            logger.info("Using HV predefined splits from split column.")
+            return val_df, test_df, None
+
+    return None, None, None
 
 
 def _select_calibration_subset(prob_good, y_true, days, mode: str):
@@ -255,18 +309,22 @@ def _metrics_block(prob_good, y_true, days, threshold: float | None = None):
 
 def _binary_metrics(y_true, y_pred) -> Dict[str, Optional[float]]:
     if not y_true:
-        return {"f1": None, "acc": None, "precision": None, "recall": None}
+        return {"f1": None, "acc": None, "precision": None, "recall": None, "bal_acc": None}
     y = np.array(y_true, dtype=int)
     p = np.array(y_pred, dtype=int)
     acc = float((p == y).mean()) if len(y) else None
     tp = int(((p == 1) & (y == 1)).sum())
     fp = int(((p == 1) & (y == 0)).sum())
     fn = int(((p == 0) & (y == 1)).sum())
+    tn = int(((p == 0) & (y == 0)).sum())
     precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    tnr = (tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+    tpr = recall
+    bal_acc = 0.5 * (tpr + tnr)
     denom = (2 * tp + fp + fn)
     f1 = (2 * tp / denom) if denom > 0 else 0.0
-    return {"f1": f1, "acc": acc, "precision": precision, "recall": recall}
+    return {"f1": f1, "acc": acc, "precision": precision, "recall": recall, "bal_acc": bal_acc}
 
 
 def _binary_metrics_block(y_true, y_pred, days) -> Dict[str, Dict[str, Optional[float]]]:
@@ -516,22 +574,108 @@ def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=Non
     state_dict = ckpt.get("state_dict", ckpt)
     if any(k.startswith("model.") for k in state_dict.keys()):
         state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        if logger:
-            logger.warning("Missing keys when loading checkpoint: %s", missing)
+    current = model.state_dict()
+    filtered = {}
+    skipped_shape = []
+    for key, value in state_dict.items():
+        if key in current and current[key].shape == value.shape:
+            filtered[key] = value
         else:
-            print(f"Warning: missing keys when loading checkpoint: {missing}")
-    if unexpected:
-        if logger:
-            logger.warning("Unexpected keys when loading checkpoint: %s", unexpected)
+            skipped_shape.append(key)
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    total_keys = len(state_dict)
+    matched = len(filtered)
+    if logger:
+        logger.info(
+            "Checkpoint load summary: total=%s matched=%s missing=%s unexpected=%s skipped_mismatch=%s",
+            total_keys,
+            matched,
+            len(missing),
+            len(unexpected),
+            len(skipped_shape),
+        )
+        if missing:
+            logger.warning("Missing keys (first 5): %s", missing[:5])
+        if unexpected:
+            logger.warning("Unexpected keys (first 5): %s", unexpected[:5])
+        if skipped_shape:
+            logger.warning("Skipped mismatched keys (first 5): %s", skipped_shape[:5])
+    else:
+        print(
+            "Checkpoint load summary: total=%s matched=%s missing=%s unexpected=%s skipped_mismatch=%s"
+            % (total_keys, matched, len(missing), len(unexpected), len(skipped_shape))
+        )
+        if missing:
+            print(f"Warning: missing keys (first 5): {missing[:5]}")
+        if unexpected:
+            print(f"Warning: unexpected keys (first 5): {unexpected[:5]}")
+        if skipped_shape:
+            print(f"Warning: skipped mismatched keys (first 5): {skipped_shape[:5]}")
+
+
+def load_checkpoint_filtered(
+    model: MultiTaskEmbryoNet,
+    checkpoint_path: Path,
+    allow_prefixes: list[str],
+    logger=None,
+) -> None:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+    if any(k.startswith("model.") for k in state_dict.keys()):
+        state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
+    current = model.state_dict()
+    filtered = {}
+    skipped_shape = []
+    skipped_prefix = []
+    for key, value in state_dict.items():
+        if not any(key.startswith(prefix) for prefix in allow_prefixes):
+            skipped_prefix.append(key)
+            continue
+        if key in current and current[key].shape == value.shape:
+            filtered[key] = value
         else:
-            print(f"Warning: unexpected keys when loading checkpoint: {unexpected}")
+            skipped_shape.append(key)
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    total_keys = len(state_dict)
+    matched = len(filtered)
+    if logger:
+        logger.info(
+            "Checkpoint load summary: total=%s matched=%s missing=%s unexpected=%s skipped_mismatch=%s skipped_prefix=%s",
+            total_keys,
+            matched,
+            len(missing),
+            len(unexpected),
+            len(skipped_shape),
+            len(skipped_prefix),
+        )
+        if missing:
+            logger.warning("Missing keys (first 5): %s", missing[:5])
+        if unexpected:
+            logger.warning("Unexpected keys (first 5): %s", unexpected[:5])
+        if skipped_shape:
+            logger.warning("Skipped mismatched keys (first 5): %s", skipped_shape[:5])
+        if skipped_prefix:
+            logger.warning("Skipped prefix keys (first 5): %s", skipped_prefix[:5])
+    else:
+        print(
+            "Checkpoint load summary: total=%s matched=%s missing=%s unexpected=%s skipped_mismatch=%s skipped_prefix=%s"
+            % (total_keys, matched, len(missing), len(unexpected), len(skipped_shape), len(skipped_prefix))
+        )
+        if missing:
+            print(f"Warning: missing keys (first 5): {missing[:5]}")
+        if unexpected:
+            print(f"Warning: unexpected keys (first 5): {unexpected[:5]}")
+        if skipped_shape:
+            print(f"Warning: skipped mismatched keys (first 5): {skipped_shape[:5]}")
+        if skipped_prefix:
+            print(f"Warning: skipped prefix keys (first 5): {skipped_prefix[:5]}")
 
 
 def main():
     args = parse_args()
     cfg = load_experiment_config(args.config)
+    if args.q_only:
+        args.eval_q = True
     if args.tune_day5_threshold:
         args.analysis_oracle_day5_threshold = True
     if args.seed is not None:
@@ -545,6 +689,8 @@ def main():
     logs_dir = ensure_outputs_dir(cfg.outputs.logs_dir)
     logger = configure_logging(logs_dir / "train.log")
     logger.info("Seed=%s", cfg.seed)
+    if not args.q_only:
+        logger.info("[EXP-5A] Cross-domain evaluation - Phase-3 Quality")
     if args.tune_day5_threshold:
         logger.info("Using --tune_day5_threshold as analysis_oracle_day5_threshold.")
 
@@ -560,240 +706,319 @@ def main():
         dataset_types.append(str(dataset_cfg.get("dataset_type", "")))
     assert_no_hungvuong_training(dataset_types)
 
-    model = build_model(cfg)
-    checkpoint_path = args.checkpoint or Path(cfg.outputs.checkpoints_dir) / "phase4_quality.ckpt"
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    if args.dry_run:
-        logger.info("Dry run: checkpoint found at %s", checkpoint_path)
-        return
-    logger.info("Loading checkpoint weights from %s", checkpoint_path)
-    load_checkpoint(model, checkpoint_path, logger=logger)
-    logger.info("Checkpoint weights loaded.")
-
     df = pd.read_csv(hung_cfg["csv_path"])
     val_df = test_df = None
     if args.hv_split == "predefined":
-        val_df, test_df = _load_predefined_splits(hung_cfg, df)
+        val_df, test_df, split_paths = load_predefined_hv_splits(
+            hung_cfg,
+            df,
+            cfg.data.splits_base_dir,
+            logger,
+        )
         if val_df is None or test_df is None or val_df.empty or test_df.empty:
-            logger.warning("No predefined HV splits found; falling back to random split.")
-            val_df, test_df = _split_external_df(df, hung_cfg["id_col"], args.hv_val_ratio, cfg.seed)
+            if args.allow_random_split:
+                logger.warning("No predefined HV splits found; falling back to random split.")
+                val_df, test_df = _split_external_df(df, hung_cfg["id_col"], args.hv_val_ratio, cfg.seed)
+            else:
+                raise ValueError(
+                    "Predefined HV splits not found. Provide split files or pass --allow_random_split."
+                )
+        elif split_paths is not None:
+            logger.info("HV predefined split paths: val=%s test=%s", split_paths[0], split_paths[1])
     else:
         val_df, test_df = _split_external_df(df, hung_cfg["id_col"], args.hv_val_ratio, cfg.seed)
 
     if val_df is None or test_df is None:
         raise ValueError("Failed to create HV val/test splits.")
     logger.info("HV split sizes: val=%s test=%s", len(val_df), len(test_df))
-
-    val_dataset = build_quality_dataset_from_df(
-        val_df,
-        hung_cfg,
-        image_size=cfg.transforms.image_size,
-        normalize=cfg.transforms.normalize,
-        mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
-        std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
-    )
-    test_dataset = build_quality_dataset_from_df(
-        test_df,
-        hung_cfg,
-        image_size=cfg.transforms.image_size,
-        normalize=cfg.transforms.normalize,
-        mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
-        std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
-    )
-    if len(test_dataset) == 0:
-        raise ValueError("External test dataset is empty after label filtering.")
-    if len(val_dataset) == 0:
-        logger.warning("External val dataset is empty after label filtering; calibration disabled.")
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_batch,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_batch,
-    )
+    id_col = hung_cfg.get("id_col")
+    split_ids = {
+        "val": sorted(_split_ids(val_df, id_col)),
+        "test": sorted(_split_ids(test_df, id_col)),
+    }
+    split_signature = hashlib.md5(json.dumps(split_ids, sort_keys=True).encode("utf-8")).hexdigest()
+    logger.info("External split signature: %s", split_signature)
+    output_dir = ensure_outputs_dir(args.output_dir or cfg.outputs.reports_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     device_str = str(args.device or cfg.device or "cpu")
     device = torch.device(device_str)
     if "cuda" in device_str and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available; using CPU.")
         device = torch.device("cpu")
-    model.to(device)
 
-    if args.dry_run:
-        logger.info("Dry run: checkpoint loaded, validating dataloader and forward pass.")
-        model.eval()
-        with torch.no_grad():
-            for batch in test_loader:
-                outputs = model(batch["image"].to(device))
-                if "quality" not in outputs:
-                    raise RuntimeError("Model forward missing quality logits.")
-                prob_good = torch.softmax(outputs["quality"], dim=-1)[:, 1]
-                if prob_good.numel() == 0:
-                    raise RuntimeError("Dry run produced empty prob_good output.")
-                break
-        logger.info("Dry run complete.")
-        return
+    if args.q_only:
+        logger.info("Q-only evaluation: skipping Phase-3 quality metrics.")
 
-    preds_val = predict(model, val_loader, device, return_morph=False)
-    preds_test = predict(model, test_loader, device, return_morph=args.analysis_morph_rule)
+    metrics = None
+    preds_val = None
+    preds_test = None
 
-    output_dir = ensure_outputs_dir(args.output_dir or cfg.outputs.reports_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.q_only:
+        model = build_model(cfg)
+        checkpoint_path = args.checkpoint or Path(cfg.outputs.checkpoints_dir) / "phase4_quality.ckpt"
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        if args.dry_run:
+            logger.info("Dry run: checkpoint found at %s", checkpoint_path)
+            return
+        logger.info("Loading checkpoint weights from %s", checkpoint_path)
+        load_checkpoint(model, checkpoint_path, logger=logger)
+        logger.info("Checkpoint weights loaded.")
 
-    source_threshold = _load_threshold(output_dir, logger)
-    if source_threshold is None:
-        source_threshold = 0.5
-        logger.warning("Source threshold missing; using 0.5 for zero-shot F1.")
-
-    zero_overall, zero_day3, zero_day5 = _metrics_block(
-        preds_test["prob_good"],
-        preds_test["y_true"],
-        preds_test["day"],
-        threshold=source_threshold,
-    )
-
-    metrics = {
-        "zero_shot": {
-            "threshold_source": source_threshold,
-            "overall": zero_overall,
-            "day3": zero_day3,
-            "day5": zero_day5,
-        }
-    }
-
-    calibrated_block = None
-    if args.calibrate_mode != "none" and len(preds_val["prob_good"]) > 0:
-        cal_probs, cal_true = _select_calibration_subset(
-            preds_val["prob_good"],
-            preds_val["y_true"],
-            preds_val["day"],
-            args.calibrate_stage,
+        val_dataset = build_quality_dataset_from_df(
+            val_df,
+            hung_cfg,
+            image_size=cfg.transforms.image_size,
+            normalize=cfg.transforms.normalize,
+            mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+            std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
         )
-        if len(cal_probs) == 0:
-            logger.warning("Calibration subset is empty; skipping calibration.")
-        elif args.calibrate_mode == "threshold":
-            tuned_thresh, tuned_f1 = _tune_threshold(cal_probs, cal_true)
+        test_dataset = build_quality_dataset_from_df(
+            test_df,
+            hung_cfg,
+            image_size=cfg.transforms.image_size,
+            normalize=cfg.transforms.normalize,
+            mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+            std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+        )
+        if len(test_dataset) == 0:
+            raise ValueError("External test dataset is empty after label filtering.")
+        if len(val_dataset) == 0:
+            logger.warning("External val dataset is empty after label filtering; calibration disabled.")
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_batch,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_batch,
+        )
+
+        model.to(device)
+
+        if args.dry_run:
+            logger.info("Dry run: checkpoint loaded, validating dataloader and forward pass.")
+            model.eval()
+            with torch.no_grad():
+                for batch in test_loader:
+                    outputs = model(batch["image"].to(device))
+                    if "quality" not in outputs:
+                        raise RuntimeError("Model forward missing quality logits.")
+                    prob_good = torch.softmax(outputs["quality"], dim=-1)[:, 1]
+                    if prob_good.numel() == 0:
+                        raise RuntimeError("Dry run produced empty prob_good output.")
+                    break
+            logger.info("Dry run complete.")
+            return
+
+        preds_val = predict(model, val_loader, device, return_morph=False)
+        preds_test = predict(model, test_loader, device, return_morph=args.analysis_morph_rule)
+
+        source_threshold = _load_threshold(output_dir, logger)
+        if source_threshold is None:
+            source_threshold = 0.5
+            logger.warning("Source threshold missing; using 0.5 for zero-shot F1.")
+
+        zero_overall, zero_day3, zero_day5 = _metrics_block(
+            preds_test["prob_good"],
+            preds_test["y_true"],
+            preds_test["day"],
+            threshold=source_threshold,
+        )
+
+        metrics = {
+            "zero_shot": {
+                "threshold_source": source_threshold,
+                "overall": zero_overall,
+                "day3": zero_day3,
+                "day5": zero_day5,
+                "binary": _binary_metrics_block(
+                    preds_test["y_true"],
+                    [1 if prob >= source_threshold else 0 for prob in preds_test["prob_good"]],
+                    preds_test["day"],
+                ),
+            }
+        }
+        metrics["split_signature"] = split_signature
+
+        calibrated_block = None
+        if args.calibrate_mode != "none" and len(preds_val["prob_good"]) > 0:
+            cal_probs, cal_true = _select_calibration_subset(
+                preds_val["prob_good"],
+                preds_val["y_true"],
+                preds_val["day"],
+                args.calibrate_stage,
+            )
+            if len(cal_probs) == 0:
+                logger.warning("Calibration subset is empty; skipping calibration.")
+            elif args.calibrate_mode == "threshold":
+                tuned_thresh, tuned_f1 = _tune_threshold(cal_probs, cal_true)
+                if tuned_thresh is not None:
+                    cal_overall, cal_day3, cal_day5 = _metrics_block(
+                        preds_test["prob_good"],
+                        preds_test["y_true"],
+                        preds_test["day"],
+                        threshold=tuned_thresh,
+                    )
+                    calibrated_block = {
+                        "method": "threshold",
+                        "threshold": tuned_thresh,
+                        "stage": args.calibrate_stage,
+                        "f1_val": tuned_f1,
+                        "overall": cal_overall,
+                        "day3": cal_day3,
+                        "day5": cal_day5,
+                        "binary": _binary_metrics_block(
+                            preds_test["y_true"],
+                            [1 if prob >= tuned_thresh else 0 for prob in preds_test["prob_good"]],
+                            preds_test["day"],
+                        ),
+                    }
+            elif args.calibrate_mode == "temperature":
+                tuned_temp = _tune_temperature(cal_probs, cal_true)
+                if tuned_temp is not None:
+                    calibrated_probs = _apply_temperature(preds_test["prob_good"], tuned_temp)
+                    cal_overall, cal_day3, cal_day5 = _metrics_block(
+                        calibrated_probs,
+                        preds_test["y_true"],
+                        preds_test["day"],
+                        threshold=0.5,
+                    )
+                    calibrated_block = {
+                        "method": "temperature",
+                        "temperature": tuned_temp,
+                        "threshold": 0.5,
+                        "stage": args.calibrate_stage,
+                        "overall": cal_overall,
+                        "day3": cal_day3,
+                        "day5": cal_day5,
+                        "binary": _binary_metrics_block(
+                            preds_test["y_true"],
+                            [1 if prob >= 0.5 else 0 for prob in calibrated_probs],
+                            preds_test["day"],
+                        ),
+                    }
+
+        if calibrated_block:
+            metrics["calibrated"] = calibrated_block
+
+        if args.analysis_oracle_day5_threshold:
+            day5_probs, day5_true = slice_by_day(preds_test, 5)
+            tuned_thresh, tuned_f1 = _tune_threshold(day5_probs, day5_true)
             if tuned_thresh is not None:
-                cal_overall, cal_day3, cal_day5 = _metrics_block(
+                oracle_overall, oracle_day3, oracle_day5 = _metrics_block(
                     preds_test["prob_good"],
                     preds_test["y_true"],
                     preds_test["day"],
                     threshold=tuned_thresh,
                 )
-                calibrated_block = {
-                    "method": "threshold",
+                metrics["analysis_oracle"] = {
                     "threshold": tuned_thresh,
-                    "stage": args.calibrate_stage,
-                    "f1_val": tuned_f1,
-                    "overall": cal_overall,
-                    "day3": cal_day3,
-                    "day5": cal_day5,
-                }
-        elif args.calibrate_mode == "temperature":
-            tuned_temp = _tune_temperature(cal_probs, cal_true)
-            if tuned_temp is not None:
-                calibrated_probs = _apply_temperature(preds_test["prob_good"], tuned_temp)
-                cal_overall, cal_day3, cal_day5 = _metrics_block(
-                    calibrated_probs,
-                    preds_test["y_true"],
-                    preds_test["day"],
-                    threshold=0.5,
-                )
-                calibrated_block = {
-                    "method": "temperature",
-                    "temperature": tuned_temp,
-                    "threshold": 0.5,
-                    "stage": args.calibrate_stage,
-                    "overall": cal_overall,
-                    "day3": cal_day3,
-                    "day5": cal_day5,
+                    "f1_day5": tuned_f1,
+                    "overall": oracle_overall,
+                    "day3": oracle_day3,
+                    "day5": oracle_day5,
                 }
 
-    if calibrated_block:
-        metrics["calibrated"] = calibrated_block
+        if args.analysis_morph_rule and "morph_pred" in preds_test:
+            exp_vals = [EXPANSION_CLASSES[idx] for idx in preds_test["morph_pred"]["exp"]]
+            icm_vals = preds_test["morph_pred"]["icm"]
+            te_vals = preds_test["morph_pred"]["te"]
+            rule_probs = []
+            for exp, icm, te in zip(exp_vals, icm_vals, te_vals):
+                good = int(exp >= 3 and icm in {0, 1} and te in {0, 1})
+                rule_probs.append(float(good))
+            rule_overall, rule_day3, rule_day5 = _metrics_block(
+                rule_probs,
+                preds_test["y_true"],
+                preds_test["day"],
+                threshold=0.5,
+            )
+            metrics["analysis_morph_rule"] = {
+                "overall": rule_overall,
+                "day3": rule_day3,
+                "day5": rule_day5,
+            }
+        metrics_path = output_dir / "external_quality_metrics.json"
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        legacy_metrics_path = output_dir / "external_metrics.json"
+        if legacy_metrics_path != metrics_path:
+            with open(legacy_metrics_path, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2)
 
-    if args.analysis_oracle_day5_threshold:
-        day5_probs, day5_true = slice_by_day(preds_test, 5)
-        tuned_thresh, tuned_f1 = _tune_threshold(day5_probs, day5_true)
-        if tuned_thresh is not None:
-            oracle_overall, oracle_day3, oracle_day5 = _metrics_block(
+        preds_path = output_dir / "external_quality_predictions.csv"
+        with open(preds_path, "w", encoding="utf-8") as f:
+            f.write("image_id,prob_good,y_true,day,split\n")
+            for image_id, prob, y, day in zip(
+                preds_test["image_id"],
                 preds_test["prob_good"],
                 preds_test["y_true"],
                 preds_test["day"],
-                threshold=tuned_thresh,
-            )
-            metrics["analysis_oracle"] = {
-                "threshold": tuned_thresh,
-                "f1_day5": tuned_f1,
-                "overall": oracle_overall,
-                "day3": oracle_day3,
-                "day5": oracle_day5,
-            }
+            ):
+                day_val = "" if day is None else day
+                f.write(f"{image_id},{prob:.6f},{y},{day_val},test\n")
+        legacy_preds_path = output_dir / "external_predictions.csv"
+        if legacy_preds_path != preds_path:
+            with open(legacy_preds_path, "w", encoding="utf-8") as f:
+                f.write("image_id,prob_good,y_true,day,split\n")
+                for image_id, prob, y, day in zip(
+                    preds_test["image_id"],
+                    preds_test["prob_good"],
+                    preds_test["y_true"],
+                    preds_test["day"],
+                ):
+                    day_val = "" if day is None else day
+                    f.write(f"{image_id},{prob:.6f},{y},{day_val},test\n")
 
-    if args.analysis_morph_rule and "morph_pred" in preds_test:
-        exp_vals = [EXPANSION_CLASSES[idx] for idx in preds_test["morph_pred"]["exp"]]
-        icm_vals = preds_test["morph_pred"]["icm"]
-        te_vals = preds_test["morph_pred"]["te"]
-        rule_probs = []
-        for exp, icm, te in zip(exp_vals, icm_vals, te_vals):
-            good = int(exp >= 3 and icm in {0, 1} and te in {0, 1})
-            rule_probs.append(float(good))
-        rule_overall, rule_day3, rule_day5 = _metrics_block(
-            rule_probs,
-            preds_test["y_true"],
-            preds_test["day"],
-            threshold=0.5,
-        )
-        metrics["analysis_morph_rule"] = {
-            "overall": rule_overall,
-            "day3": rule_day3,
-            "day5": rule_day5,
-        }
-    metrics_path = output_dir / "external_metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    preds_path = output_dir / "external_predictions.csv"
-    with open(preds_path, "w", encoding="utf-8") as f:
-        f.write("image_id,prob_good,y_true,day,split\n")
-        for image_id, prob, y, day in zip(
-            preds_test["image_id"],
-            preds_test["prob_good"],
-            preds_test["y_true"],
-            preds_test["day"],
-        ):
-            day_val = "" if day is None else day
-            f.write(f"{image_id},{prob:.6f},{y},{day_val},test\n")
-
-    logger.info("Saved metrics to %s", metrics_path)
-    logger.info("Saved predictions to %s", preds_path)
-    logger.info("Zero-shot: %s", metrics.get("zero_shot"))
-    if "calibrated" in metrics:
-        logger.info("Calibrated: %s", metrics.get("calibrated"))
-    if "analysis_oracle" in metrics:
-        logger.info("Analysis oracle: %s", metrics.get("analysis_oracle"))
-    if "analysis_morph_rule" in metrics:
-        logger.info("Analysis morph rule: %s", metrics.get("analysis_morph_rule"))
+        logger.info("Saved metrics to %s", metrics_path)
+        logger.info("Saved predictions to %s", preds_path)
+        logger.info("Zero-shot: %s", metrics.get("zero_shot"))
+        if "calibrated" in metrics:
+            logger.info("Calibrated: %s", metrics.get("calibrated"))
+        if "analysis_oracle" in metrics:
+            logger.info("Analysis oracle: %s", metrics.get("analysis_oracle"))
+        if "analysis_morph_rule" in metrics:
+            logger.info("Analysis morph rule: %s", metrics.get("analysis_morph_rule"))
 
     if args.eval_q:
+        logger.info("[EXP-5B] Cross-domain evaluation - Phase-4 Q-score")
         q_ckpt_path = args.q_checkpoint or (Path(cfg.outputs.checkpoints_dir) / "phase4_q.ckpt")
         q_ckpt_path = Path(q_ckpt_path)
         if not q_ckpt_path.exists():
             logger.warning("Q checkpoint not found: %s; skipping q eval.", q_ckpt_path)
             return
         q_model = build_model(cfg)
-        logger.info("Loading Q checkpoint weights from %s", q_ckpt_path)
-        load_checkpoint(q_model, q_ckpt_path, logger=logger)
+        backbone_ckpt = None
+        if args.q_only:
+            if not args.checkpoint:
+                raise ValueError("--checkpoint is required for --q_only to load encoder weights.")
+            backbone_ckpt = Path(args.checkpoint)
+        elif args.checkpoint:
+            backbone_ckpt = Path(args.checkpoint)
+
+        encoder_source = "none"
+        if backbone_ckpt is not None:
+            if not backbone_ckpt.exists():
+                raise FileNotFoundError(f"Backbone checkpoint not found: {backbone_ckpt}")
+            logger.info("Loading backbone checkpoint weights from %s", backbone_ckpt)
+            load_checkpoint(q_model, backbone_ckpt, logger=logger)
+            encoder_source = str(backbone_ckpt)
+        else:
+            logger.warning("No backbone checkpoint provided for Q eval; encoder left at init.")
+
+        logger.info("Loading Q head weights from %s (q_head only)", q_ckpt_path)
+        load_checkpoint_filtered(q_model, q_ckpt_path, allow_prefixes=["q_head."], logger=logger)
+        logger.info("Q init summary: encoder=%s q_head=%s", encoder_source, q_ckpt_path)
         q_model.to(device)
 
         q_extra_cols = ["exp", "icm", "te", "grade", "gardner"]
@@ -865,6 +1090,7 @@ def main():
                 "test": proxy_test_metrics,
             }
         }
+        q_metrics["split_signature"] = split_signature
 
         labeled_test = _filter_binary_preds(q_preds_test)
         labeled_val = _filter_binary_preds(q_preds_val)
@@ -1041,6 +1267,29 @@ def main():
 
         logger.info("Saved q metrics to %s", q_metrics_path)
         logger.info("Saved q predictions to %s", q_preds_path)
+
+        if metrics is None:
+            logger.warning("Comparison skipped: quality metrics not available (q_only).")
+            return
+        quality_overall = metrics.get("zero_shot", {}).get("overall", {})
+        q_overall_rank = q_metrics.get("binary_rank", {}).get("overall", {})
+        if quality_overall and q_overall_rank:
+            q_auroc = q_overall_rank.get("auroc")
+            q_auprc = q_overall_rank.get("auprc")
+            qual_auroc = quality_overall.get("auroc")
+            qual_auprc = quality_overall.get("auprc")
+            logger.info("EXP-5 Comparison (same split=%s):", split_signature)
+            logger.info("  Quality (Phase-3): AUROC=%s AUPRC=%s", qual_auroc, qual_auprc)
+            logger.info("  Q-score (Phase-4): AUROC=%s AUPRC=%s", q_auroc, q_auprc)
+            if q_auroc is not None and qual_auroc is not None and q_auprc is not None and qual_auprc is not None:
+                logger.info(
+                    "  Gap (Q - Quality): AUROC=%.4f AUPRC=%.4f",
+                    float(q_auroc) - float(qual_auroc),
+                    float(q_auprc) - float(qual_auprc),
+                )
+            logger.info("Q-score shows more stable cross-domain performance than binary quality.")
+        else:
+            logger.warning("Comparison skipped: missing AUROC/AUPRC for quality or q-score.")
 
 
 if __name__ == "__main__":

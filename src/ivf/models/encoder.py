@@ -8,6 +8,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ivf.models.encoder_embryonet_lite import EmbryoNetLite
+from ivf.utils.logging import get_logger
 
 class ConvBlock(nn.Module):
     """
@@ -71,6 +73,7 @@ class ConvNeXtMini(nn.Module):
         self.blocks = nn.Sequential(*blocks)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(dims[-1], feature_dim)
+        self.out_dim = int(feature_dim)
 
         if weights_path:
             self.load_pretrained(weights_path)
@@ -89,3 +92,56 @@ class ConvNeXtMini(nn.Module):
         x = self.pool(x).flatten(1)
         x = self.proj(x)
         return F.normalize(x, dim=-1)
+
+
+ENCODER_REGISTRY = {
+    "convnext_mini": ConvNeXtMini,
+    "embryonet_lite": EmbryoNetLite,
+}
+
+
+def _log_embryonet_lite(encoder: EmbryoNetLite, cfg) -> None:
+    logger = get_logger("ivf")
+    params = sum(p.numel() for p in encoder.parameters())
+    width_mult = getattr(cfg, "width_mult", 1.0)
+    norm = getattr(cfg, "norm", "bn")
+    logger.info("Encoder=EmbryoNetLite (from scratch). Pretrained weights disabled.")
+    logger.info(
+        "EmbryoNetLite params=%s width_mult=%s norm=%s out_dim=%s",
+        params,
+        width_mult,
+        norm,
+        encoder.out_dim,
+    )
+
+
+def build_encoder(cfg) -> nn.Module:
+    name = getattr(cfg, "name", None)
+    if not name:
+        raise ValueError("Encoder name missing in config. Set model.encoder.name explicitly.")
+    if name == "convnext_mini":
+        return ConvNeXtMini(
+            in_channels=cfg.in_channels,
+            dims=cfg.dims,
+            feature_dim=cfg.feature_dim,
+            weights_path=getattr(cfg, "weights_path", None),
+        )
+    if name == "embryonet_lite":
+        weights_path = getattr(cfg, "weights_path", None)
+        if weights_path:
+            raise RuntimeError("EmbryoNetLite must train from scratch; remove weights_path from config.")
+        encoder = EmbryoNetLite(
+            in_channels=cfg.in_channels,
+            width_mult=getattr(cfg, "width_mult", 1.0),
+            feature_dim=getattr(cfg, "feature_dim", 512),
+            use_head_conv=getattr(cfg, "use_head_conv", True),
+            norm=getattr(cfg, "norm", "bn"),
+            gn_groups=getattr(cfg, "gn_groups", 8),
+            drop_path_rate=getattr(cfg, "drop_path_rate", 0.05),
+            se_ratio=getattr(cfg, "se_ratio", 0.25),
+            stages=getattr(cfg, "stages", None),
+        )
+        _log_embryonet_lite(encoder, cfg)
+        return encoder
+    valid = ", ".join(sorted(ENCODER_REGISTRY.keys()))
+    raise ValueError(f"Unsupported encoder name: {name}. Valid options: {valid}")

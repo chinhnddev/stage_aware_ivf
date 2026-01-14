@@ -1,0 +1,25 @@
+defaults:
+  - base
+  - overrides/encoder_embryonet_lite
+
+model:
+  heads:
+    quality_conditioning: none
+
+training:
+  epochs:
+    quality: 15
+  quality:
+    warmup_epochs: 5
+    unfreeze_ratio: 0.2
+    unfreeze_last_n_blocks: 0
+    head_lr: 0.001
+    encoder_lr_scale: 0.1
+    early_stop_patience: 5
+
+outputs:
+  checkpoint_paths:
+    quality: outputs/checkpoints/phase2_stage.ckpt
+
+quality_exp:
+  checkpoint_name: phase3_quality.ckpt

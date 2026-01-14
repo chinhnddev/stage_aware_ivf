@@ -1,0 +1,6 @@
+defaults:
+  - base
+
+model:
+  encoder:
+    name: convnext_mini
