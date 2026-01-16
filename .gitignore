@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+lightning_logs/
+wandb/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -17,3 +19,5 @@ env/
 *.ckpt
 *.log
 *.tmp
+outputs/tmp/
+outputs/debug/

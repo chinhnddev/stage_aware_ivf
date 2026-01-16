@@ -130,6 +130,52 @@ def _is_missing_token(value) -> bool:
     return text.upper() in {"", "0", "ND", "NA", "N/A"}
 
 
+def _normalize_day_value(value) -> Optional[int]:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and value != value:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _apply_day_filter(df: pd.DataFrame, day_filter: Optional[list[int]], context: str) -> pd.DataFrame:
+    if not day_filter:
+        return df
+    logger = get_logger("ivf")
+    if "day" not in df.columns:
+        if set(day_filter) == {5}:
+            logger.info("Day filter requested but no day column in %s; assuming Day5-only split.", context)
+            return df
+        logger.warning("Day filter requested but no day column in %s; skipping.", context)
+        return df
+    before = len(df)
+    days = df["day"].apply(_normalize_day_value)
+    if days.isna().all():
+        if set(day_filter) == {5}:
+            logger.info("Day filter requested but day column empty in %s; assuming Day5-only split.", context)
+            return df
+        logger.warning("Day filter requested but day column empty in %s; skipping.", context)
+        return df
+    mask = days.isin(day_filter)
+    filtered = df[mask].copy()
+    logger.info("Day filter applied to %s: before=%s after=%s filter=%s", context, before, len(filtered), day_filter)
+    return filtered
+
+
 def _log_morphology_train_stats(records: list, context: str) -> None:
     logger = get_logger("ivf")
     label_counts = {
@@ -611,6 +657,7 @@ class IVFDataModule(pl.LightningDataModule):
         morph_use_weighted_sampler: bool = False,
         morph_sampler_target: str = "te",
         q_weights: Optional[Dict[str, float]] = None,
+        day_filter: Optional[list[int]] = None,
     ) -> None:
         super().__init__()
         self.phase = phase
@@ -633,6 +680,7 @@ class IVFDataModule(pl.LightningDataModule):
         self.morph_use_weighted_sampler = morph_use_weighted_sampler
         self.morph_sampler_target = morph_sampler_target
         self.q_weights = q_weights
+        self.day_filter = day_filter
         self.morph_labeled_idx = []
         self.morph_icm_counts = None
         self.morph_te_counts = None
@@ -757,8 +805,11 @@ class IVFDataModule(pl.LightningDataModule):
         if self.phase == "morph":
             train_df = _load_split_df(self.splits["blastocyst"], "train")
             val_df = _load_split_df(self.splits["blastocyst"], "val")
+            train_df = _apply_day_filter(train_df, self.day_filter, "blastocyst_train")
+            val_df = _apply_day_filter(val_df, self.day_filter, "blastocyst_val")
             try:
                 test_df = _load_split_df(self.splits["blastocyst"], "test")
+                test_df = _apply_day_filter(test_df, self.day_filter, "blastocyst_test")
             except FileNotFoundError:
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["blastocyst"], ("patient_id", "embryo_id"))
@@ -825,8 +876,11 @@ class IVFDataModule(pl.LightningDataModule):
         elif self.phase == "stage":
             train_df = _load_split_df(self.splits["humanembryo2"], "train")
             val_df = _load_split_df(self.splits["humanembryo2"], "val")
+            train_df = _apply_day_filter(train_df, self.day_filter, "humanembryo2_train")
+            val_df = _apply_day_filter(val_df, self.day_filter, "humanembryo2_val")
             try:
                 test_df = _load_split_df(self.splits["humanembryo2"], "test")
+                test_df = _apply_day_filter(test_df, self.day_filter, "humanembryo2_test")
             except FileNotFoundError:
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["humanembryo2"], ("patient_id", "embryo_id"))
@@ -847,16 +901,22 @@ class IVFDataModule(pl.LightningDataModule):
         elif self.phase == "joint":
             blast_train = _load_split_df(self.splits["blastocyst"], "train")
             blast_val = _load_split_df(self.splits["blastocyst"], "val")
+            blast_train = _apply_day_filter(blast_train, self.day_filter, "joint_blast_train")
+            blast_val = _apply_day_filter(blast_val, self.day_filter, "joint_blast_val")
             try:
                 blast_test = _load_split_df(self.splits["blastocyst"], "test")
+                blast_test = _apply_day_filter(blast_test, self.day_filter, "joint_blast_test")
             except FileNotFoundError:
                 blast_test = None
             group_col = _resolve_group_col(blast_train, self.splits["blastocyst"], ("patient_id", "embryo_id"))
             _assert_no_group_overlap_dfs(blast_train, blast_val, blast_test, group_col, context="blastocyst")
             human_train = _load_split_df(self.splits["humanembryo2"], "train")
             human_val = _load_split_df(self.splits["humanembryo2"], "val")
+            human_train = _apply_day_filter(human_train, self.day_filter, "joint_human_train")
+            human_val = _apply_day_filter(human_val, self.day_filter, "joint_human_val")
             try:
                 human_test = _load_split_df(self.splits["humanembryo2"], "test")
+                human_test = _apply_day_filter(human_test, self.day_filter, "joint_human_test")
             except FileNotFoundError:
                 human_test = None
             group_col = _resolve_group_col(human_train, self.splits["humanembryo2"], ("patient_id", "embryo_id"))
@@ -901,8 +961,11 @@ class IVFDataModule(pl.LightningDataModule):
         elif self.phase == "quality":
             train_df = _load_split_df(self.splits["quality"], "train")
             val_df = _load_split_df(self.splits["quality"], "val")
+            train_df = _apply_day_filter(train_df, self.day_filter, "quality_train")
+            val_df = _apply_day_filter(val_df, self.day_filter, "quality_val")
             try:
                 test_df = _load_split_df(self.splits["quality"], "test")
+                test_df = _apply_day_filter(test_df, self.day_filter, "quality_test")
             except FileNotFoundError:
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["quality"], ("embryo_id", "patient_id"))
@@ -930,8 +993,11 @@ class IVFDataModule(pl.LightningDataModule):
         elif self.phase == "q":
             train_df = _load_split_df(self.splits["blastocyst"], "train")
             val_df = _load_split_df(self.splits["blastocyst"], "val")
+            train_df = _apply_day_filter(train_df, self.day_filter, "q_train")
+            val_df = _apply_day_filter(val_df, self.day_filter, "q_val")
             try:
                 test_df = _load_split_df(self.splits["blastocyst"], "test")
+                test_df = _apply_day_filter(test_df, self.day_filter, "q_test")
             except FileNotFoundError:
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["blastocyst"], ("patient_id", "embryo_id"))

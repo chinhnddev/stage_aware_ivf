@@ -7,8 +7,8 @@ id_col: embryo_id
 day_col: day
 include_meta_day: false
 split:
-  group_col: patient_id
+  group_col: id
   val_ratio: 0.2
-  test_ratio: 0.0
+  test_ratio: 0.1
   stratified: true
   min_val_per_class: 3

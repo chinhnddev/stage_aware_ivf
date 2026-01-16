@@ -3,9 +3,13 @@ defaults:
   - overrides/encoder_embryonet_lite
 
 model:
-  heads:
-    quality_conditioning: none
+  encoder_config: null
+  heads_config: null
   use_q_score: true
+  heads:
+    quality_mode: concat
+    quality_conditioning: none
+    q_head_hidden_dim: 256
 
 training:
   epochs:
@@ -24,7 +28,17 @@ training:
     freeze_backbone: true
     aux_alpha: 0.0
     unfreeze_last_n_blocks: 0
+    ranking_loss: false
+    ranking_weight: 0.1
+    ranking_margin: 0.05
+    ranking_pairs: 256
+
+quality_exp:
+  derive_quality: true
+  exp_min: 3
+  icm_good: [1, 2]
+  te_good: [1, 2]
 
 outputs:
   checkpoint_paths:
-    q: outputs/checkpoints/phase2_stage.ckpt
+    q: outputs/checkpoints/phase1/phase1_morph.ckpt

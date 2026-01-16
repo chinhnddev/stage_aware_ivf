@@ -37,6 +37,10 @@ class MultiTaskLightningModule(pl.LightningModule):
         q_loss: str = "smoothl1",
         q_aux_alpha: float = 0.0,
         q_freeze_backbone: bool = True,
+        q_ranking_loss: bool = False,
+        q_ranking_weight: float = 0.1,
+        q_ranking_margin: float = 0.05,
+        q_ranking_pairs: int = 256,
         quality_warmup_epochs: int = 0,
         quality_unfreeze_ratio: float = 0.0,
         quality_unfreeze_last_n_blocks: int = 0,
@@ -64,6 +68,10 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.q_loss = q_loss
         self.q_aux_alpha = q_aux_alpha
         self.q_freeze_backbone = q_freeze_backbone
+        self.q_ranking_loss = bool(q_ranking_loss)
+        self.q_ranking_weight = float(q_ranking_weight)
+        self.q_ranking_margin = float(q_ranking_margin)
+        self.q_ranking_pairs = int(q_ranking_pairs)
         self.quality_warmup_epochs = int(quality_warmup_epochs)
         self.quality_unfreeze_ratio = float(quality_unfreeze_ratio)
         self.quality_unfreeze_last_n_blocks = int(quality_unfreeze_last_n_blocks)
@@ -78,9 +86,12 @@ class MultiTaskLightningModule(pl.LightningModule):
         self._val_counts = None
         self._collapse_streak = {"icm": 0, "te": 0}
         self._quality_confusion = None
+        self._q_val_stats = None
         self.exp_class_weight = None
         self.icm_class_weight = None
         self.te_class_weight = None
+        self.use_stage = bool(getattr(model, "use_stage", True))
+        self.use_q_score = bool(getattr(model, "use_q_score", True))
         self.icm_num_classes = len(ICM_CLASSES)
         self.te_num_classes = len(TE_CLASSES)
         self.exp_class_counts = None
@@ -89,6 +100,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.focal_gamma = 2.0
         self.use_focal_icm = False
         self.use_focal_te = False
+        if not self.use_stage:
+            get_logger("ivf").info("Stage disabled (use_stage=false). Stage head and losses are skipped.")
 
         if self.morph_loss_reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
@@ -96,11 +109,15 @@ class MultiTaskLightningModule(pl.LightningModule):
             raise ValueError(f"Unsupported class_weight_mode: {self.class_weight_mode}")
         if self.q_loss not in {"smoothl1", "mse"}:
             raise ValueError(f"Unsupported q_loss: {self.q_loss}")
+        if self.q_ranking_pairs < 0:
+            raise ValueError("q_ranking_pairs must be >= 0.")
+        if self.phase == "q" and not self.use_q_score:
+            raise ValueError("Phase q requested but use_q_score=false. Enable use_q_score to train q_head.")
 
         self._apply_phase_freeze(initial=True)
 
         self.morph_metrics = nn.ModuleDict(build_morphology_metrics())
-        self.stage_metrics = nn.ModuleDict(build_stage_metrics())
+        self.stage_metrics = nn.ModuleDict(build_stage_metrics()) if self.use_stage else nn.ModuleDict()
         self.quality_metrics = nn.ModuleDict(build_quality_metrics())
 
         self._epoch_start_time = None
@@ -132,13 +149,15 @@ class MultiTaskLightningModule(pl.LightningModule):
         if self.phase == "morph":
             self._set_trainable(self.model.encoder, True)
             self._set_trainable(self.model.morph, True)
-            self._set_trainable(self.model.stage, False)
+            if self.use_stage and self.model.stage is not None:
+                self._set_trainable(self.model.stage, False)
             self._set_trainable(self.model.quality, False)
             logger.info("EXP-1 Morphology: encoder+morph trainable; stage+quality frozen.")
         elif self.phase == "stage":
             self._set_trainable(self.model.encoder, True)
             self._set_trainable(self.model.morph, False)
-            self._set_trainable(self.model.stage, True)
+            if self.use_stage and self.model.stage is not None:
+                self._set_trainable(self.model.stage, True)
             self._set_trainable(self.model.quality, False)
             if initial:
                 freeze_ratio = self.freeze_config.get("stage_start_ratio", 0.8)
@@ -147,13 +166,15 @@ class MultiTaskLightningModule(pl.LightningModule):
         elif self.phase == "joint":
             self._set_trainable(self.model.encoder, True)
             self._set_trainable(self.model.morph, True)
-            self._set_trainable(self.model.stage, True)
+            if self.use_stage and self.model.stage is not None:
+                self._set_trainable(self.model.stage, True)
             self._set_trainable(self.model.quality, False)
             logger.info("EXP-3 Joint stabilization: encoder+morph+stage trainable; quality frozen.")
         elif self.phase == "quality":
             freeze_encoder(self.model, ratio=1.0)
             self._set_trainable(self.model.morph, False)
-            self._set_trainable(self.model.stage, False)
+            if self.use_stage and self.model.stage is not None:
+                self._set_trainable(self.model.stage, False)
             self._set_trainable(self.model.quality, True)
             logger.info("EXP-4 Quality: encoder+morph+stage frozen; quality trainable.")
         elif self.phase == "q":
@@ -162,9 +183,11 @@ class MultiTaskLightningModule(pl.LightningModule):
             else:
                 self._set_trainable(self.model.encoder, True)
             self._set_trainable(self.model.morph, False)
-            self._set_trainable(self.model.stage, False)
+            if self.use_stage and self.model.stage is not None:
+                self._set_trainable(self.model.stage, False)
             self._set_trainable(self.model.quality, False)
-            self._set_trainable(self.model.q_head, True)
+            if self.model.q_head is not None:
+                self._set_trainable(self.model.q_head, True)
             unfreeze_blocks = int(self.freeze_config.get("q_unfreeze_last_n_blocks", 0))
             if self.q_freeze_backbone and unfreeze_blocks > 0:
                 self._unfreeze_last_encoder_blocks(unfreeze_blocks)
@@ -188,7 +211,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             if self.current_epoch < warmup_epochs:
                 freeze_encoder(self.model, ratio=1.0)
                 self._set_trainable(self.model.morph, False)
-                self._set_trainable(self.model.stage, False)
+                if self.use_stage and self.model.stage is not None:
+                    self._set_trainable(self.model.stage, False)
                 self._set_trainable(self.model.quality, True)
                 get_logger("ivf").info(
                     "Quality warmup epoch %s/%s: encoder frozen; quality head trainable.",
@@ -197,7 +221,8 @@ class MultiTaskLightningModule(pl.LightningModule):
                 )
             else:
                 self._set_trainable(self.model.morph, False)
-                self._set_trainable(self.model.stage, False)
+                if self.use_stage and self.model.stage is not None:
+                    self._set_trainable(self.model.stage, False)
                 self._set_trainable(self.model.quality, True)
                 if self.quality_unfreeze_last_n_blocks > 0:
                     freeze_encoder(self.model, ratio=1.0)
@@ -249,6 +274,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             self._val_counts = {"exp": 0, "icm": 0, "te": 0}
         if self.phase == "quality":
             self._quality_confusion = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+        if self.phase == "q":
+            self._q_val_stats = {"count": 0, "sum": 0.0, "sumsq": 0.0, "min": None, "max": None}
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         if not self.trainer or getattr(self.trainer, "sanity_checking", False):
@@ -383,6 +410,33 @@ class MultiTaskLightningModule(pl.LightningModule):
             loss = F.smooth_l1_loss(preds, targets)
         return loss * weight
 
+    def _ranking_loss(self, preds: torch.Tensor, targets: torch.Tensor) -> Optional[torch.Tensor]:
+        if preds.numel() < 2 or targets.numel() < 2:
+            return None
+        num_pairs = self.q_ranking_pairs
+        max_items = preds.numel()
+        if num_pairs > 0:
+            max_items = min(max_items, num_pairs * 2)
+        idx = torch.randperm(preds.numel(), device=preds.device)[:max_items]
+        if idx.numel() < 2:
+            return None
+        if idx.numel() % 2 == 1:
+            idx = idx[:-1]
+        pairs = idx.view(-1, 2)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        target_diff = targets[left] - targets[right]
+        signs = torch.sign(target_diff)
+        keep = signs != 0
+        if not keep.any():
+            return None
+        return F.margin_ranking_loss(
+            preds[left][keep],
+            preds[right][keep],
+            signs[keep],
+            margin=self.q_ranking_margin,
+        )
+
     def _compute_losses(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
         losses = {}
 
@@ -440,7 +494,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     total = total / len(morph_losses)
                 losses["morphology"] = total
 
-        if self.phase in {"stage", "joint"}:
+        if self.phase in {"stage", "joint"} and self.use_stage:
             stage_loss = self._masked_ce(
                 outputs["stage"],
                 targets["stage"],
@@ -480,6 +534,17 @@ class MultiTaskLightningModule(pl.LightningModule):
             if q_loss is not None:
                 losses["q"] = q_loss
 
+            if self.q_ranking_loss and q_loss is not None:
+                q_target = targets["q"].float()
+                mask = targets.get("q_mask")
+                mask = mask > 0 if mask is not None else q_target >= 0
+                if mask.any():
+                    q_pred = outputs["q"][mask].float()
+                    q_true = q_target[mask]
+                    rank_loss = self._ranking_loss(q_pred, q_true)
+                    if rank_loss is not None:
+                        losses["q_rank"] = rank_loss * self.q_ranking_weight
+
             if self.q_aux_alpha > 0:
                 aux_losses = []
                 loss_exp = self._masked_ce(
@@ -512,14 +577,15 @@ class MultiTaskLightningModule(pl.LightningModule):
                 )
                 if loss_te is not None:
                     aux_losses.append(loss_te)
-                stage_loss = self._masked_ce(
-                    outputs["stage"],
-                    targets.get("stage", torch.tensor(IGNORE_INDEX, device=outputs["stage"].device)),
-                    None,
-                    self.q_aux_alpha,
-                )
-                if stage_loss is not None:
-                    aux_losses.append(stage_loss)
+                if self.use_stage and "stage" in outputs:
+                    stage_loss = self._masked_ce(
+                        outputs["stage"],
+                        targets.get("stage", torch.tensor(IGNORE_INDEX, device=outputs["stage"].device)),
+                        None,
+                        self.q_aux_alpha,
+                    )
+                    if stage_loss is not None:
+                        aux_losses.append(stage_loss)
                 if aux_losses:
                     losses["q_aux"] = sum(aux_losses)
 
@@ -543,6 +609,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.log("train/q_loss", losses["q"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         if "q_aux" in losses:
             self.log("train/q_aux_loss", losses["q_aux"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q_rank" in losses:
+            self.log("train/q_rank_loss", losses["q_rank"], on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
         return losses["total"]
 
     def validation_step(self, batch: Dict, batch_idx: int):
@@ -561,6 +629,8 @@ class MultiTaskLightningModule(pl.LightningModule):
             self.log("val/q_loss", losses["q"], on_epoch=True, prog_bar=False, batch_size=batch_size)
         if "q_aux" in losses:
             self.log("val/q_aux_loss", losses["q_aux"], on_epoch=True, prog_bar=False, batch_size=batch_size)
+        if "q_rank" in losses:
+            self.log("val/q_rank_loss", losses["q_rank"], on_epoch=True, prog_bar=False, batch_size=batch_size)
 
         targets = batch["targets"]
 
@@ -617,7 +687,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                         true_counts = torch.bincount(t.detach().cpu()[mask_cpu], minlength=num_classes)
                         self._val_true_counts[head] += true_counts
 
-        if self.phase in {"stage", "joint"}:
+        if self.phase in {"stage", "joint"} and self.use_stage:
             t = targets["stage"]
             mask = t >= 0
             if mask.any():
@@ -660,6 +730,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                 self.log("val/q_rmse", rmse, on_epoch=True, prog_bar=False, batch_size=batch_size)
                 self.log("val/q_mae", mae, on_epoch=True, prog_bar=False, batch_size=batch_size)
                 self.log("val/q_n", q_n, on_epoch=True, prog_bar=False, batch_size=batch_size)
+                if self._q_val_stats is not None:
+                    q_pred_cpu = q_pred.detach().cpu()
+                    self._q_val_stats["count"] += int(q_pred_cpu.numel())
+                    self._q_val_stats["sum"] += float(q_pred_cpu.sum().item())
+                    self._q_val_stats["sumsq"] += float((q_pred_cpu ** 2).sum().item())
+                    current_min = float(q_pred_cpu.min().item())
+                    current_max = float(q_pred_cpu.max().item())
+                    if self._q_val_stats["min"] is None or current_min < self._q_val_stats["min"]:
+                        self._q_val_stats["min"] = current_min
+                    if self._q_val_stats["max"] is None or current_max > self._q_val_stats["max"]:
+                        self._q_val_stats["max"] = current_max
             else:
                 device = getattr(self, "device", None) or q_target.device
                 self.log("val/q_rmse", torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False, batch_size=batch_size)
@@ -726,6 +807,18 @@ class MultiTaskLightningModule(pl.LightningModule):
         if self.phase == "q":
             _append(parts, "val_q_rmse", "val/q_rmse")
             _append(parts, "val_q_mae", "val/q_mae")
+            if self._q_val_stats is not None and self._q_val_stats.get("count", 0) > 0:
+                count = self._q_val_stats["count"]
+                mean = self._q_val_stats["sum"] / count
+                var = max(self._q_val_stats["sumsq"] / count - mean ** 2, 0.0)
+                std = var ** 0.5
+                device = getattr(self, "device", None) or torch.device("cpu")
+                self.log("val/q_mean", torch.tensor(mean, device=device), on_epoch=True, prog_bar=False)
+                self.log("val/q_std", torch.tensor(std, device=device), on_epoch=True, prog_bar=False)
+                self.log("val/q_min", torch.tensor(self._q_val_stats["min"], device=device), on_epoch=True, prog_bar=False)
+                self.log("val/q_max", torch.tensor(self._q_val_stats["max"], device=device), on_epoch=True, prog_bar=False)
+                parts.append(f"val_q_mean={mean:.4f}")
+                parts.append(f"val_q_std={std:.4f}")
 
         if len(parts) > 1:
             get_logger("ivf").info(" ".join(parts))

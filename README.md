@@ -43,11 +43,7 @@ model:
 model:
   encoder_config: configs/model/encoder_embryonet_lite.yaml
 ```
-```yaml
-# Phase 4q (q-score)
-model:
-  encoder_config: configs/model/encoder_embryonet_lite.yaml
-```
+Note: Phase-4q (latent q-score) is archived by default because morphology GT is too sparse. Enable with `model.use_q_score: true` if needed.
 
 ## Training order & why
 - Phase 1 (morphology): learn EXP/ICM/TE on blastocysts with light augmentations; establishes morphology features.
@@ -55,6 +51,7 @@ model:
 - Phase 2 (stage): learn stage with medium augmentations; encoder progressively unfrozen for stage awareness.
 - Phase 3 (joint): light joint adaptation on blastocyst + HumanEmbryo2.0; balanced morphology/stage losses.
 - Phase 4 (quality): train only the morphology+stage-conditioned quality head; encoder, morphology, and stage heads frozen.
+- Phase 4q (q-score) is disabled by default; enable only for research experiments with sufficient morphology GT.
 - Augmentations are applied ONLY in train loaders; val/test/external always use eval transforms.
 - Pipeline overview: see `docs/PIPELINE.md`.
 

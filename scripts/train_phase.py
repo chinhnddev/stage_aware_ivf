@@ -1069,6 +1069,9 @@ def build_model(cfg) -> MultiTaskEmbryoNet:
         feature_dim=feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
         quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
+        q_head_hidden_dim=getattr(model_cfg.heads, "q_head_hidden_dim", None),
+        use_stage=bool(getattr(model_cfg, "use_stage", True)),
+        use_q_score=bool(getattr(model_cfg, "use_q_score", False)),
     )
 
 
@@ -1076,6 +1079,11 @@ def get_prev_checkpoint(phase: str, checkpoints_dir: Path, cfg):
     overrides = getattr(cfg.outputs, "checkpoint_paths", {}) or {}
     if phase in overrides:
         return Path(overrides[phase])
+
+    use_stage = bool(getattr(cfg.model, "use_stage", True))
+    if not use_stage and phase in {"quality", "q"}:
+        morph_ckpt = checkpoints_dir / "phase1_morph.ckpt"
+        return morph_ckpt if morph_ckpt.exists() else None
 
     if phase == "stage":
         return checkpoints_dir / "phase1_morph.ckpt"
@@ -1098,6 +1106,10 @@ def main():
     args = parse_args()
     phase = args.phase
     cfg = load_experiment_config(args.config)
+    if phase == "q" and not getattr(cfg.model, "use_q_score", False):
+        raise ValueError("Phase q is disabled (use_q_score=false). Enable use_q_score to train q_head.")
+    if not getattr(cfg.model, "use_stage", True) and phase in {"stage", "joint"}:
+        raise ValueError("Stage disabled (use_stage=false); phase=stage/joint is not allowed for this ablation.")
     if args.seed is not None:
         cfg.seed = args.seed
     if args.num_workers is not None:
@@ -1112,6 +1124,8 @@ def main():
     logs_dir = ensure_outputs_dir(cfg.outputs.logs_dir)
     logger = configure_logging(logs_dir / "train.log")
     logger.info("Seed=%s", cfg.seed)
+    if not getattr(cfg.model, "use_stage", True):
+        logger.info("Stage disabled (use_stage=false) for this training run.")
 
     quality_ckpt_name = getattr(getattr(cfg, "quality_exp", None), "checkpoint_name", None) or "phase4_quality.ckpt"
     quality_ckpt_path = Path(quality_ckpt_name)
@@ -1148,10 +1162,8 @@ def main():
         raise RuntimeError(
             f"Config requests embryonet_lite but got {actual_name}. Check config overrides."
         )
-    if requested_name == "convnext_mini" and actual_name != "ConvNeXtMini":
-        raise RuntimeError(
-            f"Config requests convnext_mini but got {actual_name}. Check config overrides."
-        )
+    if requested_name == "convnext_mini":
+        raise RuntimeError("ConvNeXtMini is disabled. Use embryonet_lite instead.")
     logger.info("Quality conditioning mode: %s", model.quality_conditioning)
     phase_cfg = cfg.training
     loss_weights = resolve_config_dict(phase_cfg.loss_weights)
@@ -1178,6 +1190,10 @@ def main():
     q_aux_alpha = float(getattr(q_cfg, "aux_alpha", 0.0)) if q_cfg is not None else 0.0
     q_freeze_backbone = bool(getattr(q_cfg, "freeze_backbone", True)) if q_cfg is not None else True
     q_unfreeze_last_n_blocks = int(getattr(q_cfg, "unfreeze_last_n_blocks", 0)) if q_cfg is not None else 0
+    q_ranking_loss = bool(getattr(q_cfg, "ranking_loss", False)) if q_cfg is not None else False
+    q_ranking_weight = float(getattr(q_cfg, "ranking_weight", 0.1)) if q_cfg is not None else 0.1
+    q_ranking_margin = float(getattr(q_cfg, "ranking_margin", 0.05)) if q_cfg is not None else 0.05
+    q_ranking_pairs = int(getattr(q_cfg, "ranking_pairs", 256)) if q_cfg is not None else 256
     quality_cfg = getattr(phase_cfg, "quality", None)
     quality_warmup_epochs = int(getattr(quality_cfg, "warmup_epochs", 0)) if quality_cfg is not None else 0
     quality_unfreeze_ratio = float(getattr(quality_cfg, "unfreeze_ratio", 0.0)) if quality_cfg is not None else 0.0
@@ -1204,6 +1220,12 @@ def main():
 
     data_cfg = cfg.data
     splits_base_dir = data_cfg.splits_base_dir
+    if data_cfg is not None and getattr(data_cfg, "day_filter", None) is not None:
+        day_filter = resolve_config_dict(data_cfg.day_filter)
+    else:
+        day_filter = None
+    if getattr(data_cfg, "only_day5", False) and not day_filter:
+        day_filter = [5]
     splits = {}
     if phase in {"morph", "joint", "q"}:
         blast_split_files = blast_cfg.get("split_files")
@@ -1276,6 +1298,10 @@ def main():
         q_loss=q_loss,
         q_aux_alpha=q_aux_alpha,
         q_freeze_backbone=q_freeze_backbone,
+        q_ranking_loss=q_ranking_loss,
+        q_ranking_weight=q_ranking_weight,
+        q_ranking_margin=q_ranking_margin,
+        q_ranking_pairs=q_ranking_pairs,
         quality_warmup_epochs=quality_warmup_epochs,
         quality_unfreeze_ratio=quality_unfreeze_ratio,
         quality_unfreeze_last_n_blocks=quality_unfreeze_last_n_blocks,
@@ -1293,8 +1319,10 @@ def main():
             )
     if prev_ckpt is not None and prev_ckpt.exists():
         logger.info("Loading checkpoint weights from %s", prev_ckpt)
-        if phase == "quality":
+        if phase in {"quality", "q"}:
             load_encoder_only_from_ckpt(lightning_module, prev_ckpt, logger)
+            if phase == "q":
+                logger.info("Phase 4 Q init: loaded encoder only from %s; q_head reset.", prev_ckpt)
         else:
             try:
                 lightning_module = MultiTaskLightningModule.load_from_checkpoint(
@@ -1312,6 +1340,10 @@ def main():
                     q_loss=q_loss,
                     q_aux_alpha=q_aux_alpha,
                     q_freeze_backbone=q_freeze_backbone,
+                    q_ranking_loss=q_ranking_loss,
+                    q_ranking_weight=q_ranking_weight,
+                    q_ranking_margin=q_ranking_margin,
+                    q_ranking_pairs=q_ranking_pairs,
                     strict=True,
                 )
             except RuntimeError as exc:
@@ -1354,6 +1386,7 @@ def main():
         morph_use_weighted_sampler=morph_use_weighted_sampler,
         morph_sampler_target=morph_sampler_target,
         q_weights=q_weights,
+        day_filter=day_filter,
     )
 
     datamodule.setup()
@@ -1513,6 +1546,10 @@ def main():
             q_loss=q_loss,
             q_aux_alpha=q_aux_alpha,
             q_freeze_backbone=q_freeze_backbone,
+            q_ranking_loss=q_ranking_loss,
+            q_ranking_weight=q_ranking_weight,
+            q_ranking_margin=q_ranking_margin,
+            q_ranking_pairs=q_ranking_pairs,
         )
         _tune_quality_threshold(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
         _run_quality_test_eval(eval_module.model, datamodule.test_dataloader(), reports_dir, eval_device, logger)
@@ -1542,6 +1579,10 @@ def main():
             q_loss=q_loss,
             q_aux_alpha=q_aux_alpha,
             q_freeze_backbone=q_freeze_backbone,
+            q_ranking_loss=q_ranking_loss,
+            q_ranking_weight=q_ranking_weight,
+            q_ranking_margin=q_ranking_margin,
+            q_ranking_pairs=q_ranking_pairs,
         )
         _tune_q_thresholds(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
     else:

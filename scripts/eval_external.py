@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+from torch import nn
 import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
@@ -22,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from ivf.config import load_experiment_config
-from ivf.data.datasets import collate_batch
+from ivf.data.datasets import BaseImageDataset, collate_batch
+from ivf.data.datamodule import _build_q_records
 from ivf.data.label_schema import (
     EXPANSION_CLASSES,
     normalize_gardner_exp,
@@ -30,6 +32,8 @@ from ivf.data.label_schema import (
     parse_gardner_components,
     q_proxy_from_components,
 )
+from ivf.data.transforms import assert_no_augmentation, get_eval_transforms
+from ivf.derived_eval import compute_derived_binary_metrics, derive_good_poor_from_morph, tune_threshold_on_val
 from ivf.eval import _normalize_day, build_quality_dataset_from_df, compute_metrics, predict, slice_by_day
 from ivf.models.encoder import build_encoder
 from ivf.models.multitask import MultiTaskEmbryoNet
@@ -102,6 +106,62 @@ def parse_args():
         action="store_true",
         help="Skip quality evaluation and run q-score evaluation only.",
     )
+    parser.add_argument(
+        "--eval_in_domain_q",
+        action="store_true",
+        help="Run in-domain Phase-4 Q-score evaluation on internal splits.",
+    )
+    parser.add_argument(
+        "--in_domain_no_val",
+        action="store_true",
+        help="Allow in-domain Q evaluation without a validation split (thresholded metrics disabled).",
+    )
+    parser.add_argument(
+        "--in_domain_val_csv",
+        default=None,
+        help="Optional in-domain validation split CSV for Q evaluation.",
+    )
+    parser.add_argument(
+        "--in_domain_test_csv",
+        default=None,
+        help="Optional in-domain test split CSV for Q evaluation.",
+    )
+    parser.add_argument(
+        "--also_report_thresholded",
+        action="store_true",
+        help="Also report thresholded decision metrics (calibrated on VAL only).",
+    )
+    parser.add_argument(
+        "--derive_quality_from_morph",
+        action="store_true",
+        help="Derive binary quality labels from exp/icm/te for in-domain eval if labels are missing.",
+    )
+    parser.add_argument(
+        "--check_q_compat",
+        action="store_true",
+        help="Validate q_head compatibility with the current config and exit.",
+    )
+    parser.add_argument(
+        "--derived_thresholded",
+        action="store_true",
+        help="Report thresholded derived-eval metrics (threshold tuned on VAL only).",
+    )
+    parser.add_argument(
+        "--derived_objective",
+        choices=["f1", "bal_acc"],
+        default="f1",
+        help="Objective for derived-eval threshold tuning on VAL.",
+    )
+    parser.add_argument(
+        "--no_stage",
+        action="store_true",
+        help="Disable stage head usage for this evaluation run.",
+    )
+    parser.add_argument(
+        "--day5_only",
+        action="store_true",
+        help="Filter evaluation splits to Day-5 samples only.",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +175,9 @@ def build_model(cfg) -> MultiTaskEmbryoNet:
         feature_dim=feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
         quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
+        q_head_hidden_dim=getattr(model_cfg.heads, "q_head_hidden_dim", None),
+        use_stage=bool(getattr(model_cfg, "use_stage", True)),
+        use_q_score=bool(getattr(model_cfg, "use_q_score", False)),
     )
 
 
@@ -232,6 +295,193 @@ def _split_ids(df: pd.DataFrame, id_col: Optional[str]) -> list[str]:
     return df.index.astype(str).tolist()
 
 
+def _apply_day5_filter(df: pd.DataFrame, day_col: Optional[str], logger, context: str) -> pd.DataFrame:
+    if not day_col or day_col not in df.columns:
+        logger.info("Day5-only requested but day column missing for %s; assuming Day5-only split.", context)
+        return df
+    before = len(df)
+    days = df[day_col].apply(_normalize_day)
+    filtered = df[days == 5].copy()
+    logger.info("Day5-only filter applied to %s: before=%s after=%s", context, before, len(filtered))
+    return filtered
+
+
+def _run_derived_eval(
+    preds_val: Dict[str, list],
+    preds_test: Dict[str, list],
+    rule_cfg,
+    output_dir: Path,
+    thresholded: bool,
+    objective: str,
+    logger,
+    prefix: str,
+):
+    scores_test = preds_test.get("q_score", []) if preds_test else []
+    if not scores_test:
+        logger.warning("Derived eval skipped: no q_score values.")
+        return None
+
+    def _collect(preds):
+        q_scores = preds.get("q_score", [])
+        exp_raw = preds.get("exp_raw", [])
+        icm_raw = preds.get("icm_raw", [])
+        te_raw = preds.get("te_raw", [])
+        grade_raw = preds.get("grade_raw", [])
+        gardner_raw = preds.get("gardner_raw", [])
+        image_ids = preds.get("image_id", [])
+        labels = []
+        exp_used = []
+        icm_used = []
+        te_used = []
+        sources = []
+        for idx in range(len(q_scores)):
+            exp_val = exp_raw[idx] if idx < len(exp_raw) else None
+            icm_val = icm_raw[idx] if idx < len(icm_raw) else None
+            te_val = te_raw[idx] if idx < len(te_raw) else None
+            grade_val = grade_raw[idx] if idx < len(grade_raw) else None
+            gardner_val = gardner_raw[idx] if idx < len(gardner_raw) else None
+            label, exp_parsed, icm_parsed, te_parsed, source = derive_good_poor_from_morph(
+                exp_val,
+                icm_val,
+                te_val,
+                rule_cfg,
+                grade=grade_val,
+                gardner=gardner_val,
+                return_components=True,
+            )
+            labels.append(label)
+            exp_used.append(exp_parsed)
+            icm_used.append(icm_parsed)
+            te_used.append(te_parsed)
+            sources.append(source)
+        return {
+            "q_score": q_scores,
+            "labels": labels,
+            "exp_used": exp_used,
+            "icm_used": icm_used,
+            "te_used": te_used,
+            "sources": sources,
+            "image_id": image_ids,
+        }
+
+    derived_val = _collect(preds_val) if preds_val else {"q_score": [], "labels": []}
+    derived_test = _collect(preds_test)
+
+    def _filter(scores, labels):
+        filtered_scores = []
+        filtered_labels = []
+        for score, label in zip(scores, labels):
+            if label is None:
+                continue
+            filtered_scores.append(score)
+            filtered_labels.append(int(label))
+        return filtered_scores, filtered_labels
+
+    val_scores, val_labels = _filter(derived_val.get("q_score", []), derived_val.get("labels", []))
+    test_scores, test_labels = _filter(derived_test.get("q_score", []), derived_test.get("labels", []))
+
+    excluded_val = len(derived_val.get("labels", [])) - len(val_labels)
+    excluded_test = len(derived_test.get("labels", [])) - len(test_labels)
+    logger.info(
+        "Derived eval: excluded %s val samples and %s test samples due to missing morphology.",
+        excluded_val,
+        excluded_test,
+    )
+
+    if len(test_labels) == 0:
+        logger.warning("Derived eval skipped: no usable morphology labels.")
+        return None
+
+    if len(val_labels) < 20 or len(test_labels) < 20:
+        logger.warning(
+            "Derived eval: small sample size (val=%s test=%s); metrics may be unstable.",
+            len(val_labels),
+            len(test_labels),
+        )
+    if len(set(test_labels)) < 2:
+        logger.warning("Derived eval: TEST labels have a single class; AUROC/AUPRC may be undefined.")
+    if len(val_labels) > 0 and len(set(val_labels)) < 2:
+        logger.warning("Derived eval: VAL labels have a single class; threshold tuning may be skipped.")
+
+    derived_metrics = {
+        "rule": {
+            "exp_min": int(getattr(rule_cfg, "exp_min", 3)) if rule_cfg is not None else 3,
+            "icm_good": list(getattr(rule_cfg, "icm_good", [1, 2]) if rule_cfg is not None else [1, 2]),
+            "te_good": list(getattr(rule_cfg, "te_good", [1, 2]) if rule_cfg is not None else [1, 2]),
+        },
+        "counts": {
+            "val_used": len(val_labels),
+            "test_used": len(test_labels),
+            "val_excluded": excluded_val,
+            "test_excluded": excluded_test,
+        },
+        "test": compute_derived_binary_metrics(test_scores, test_labels),
+    }
+
+    threshold_payload = None
+    if thresholded:
+        best_thresh, best_score = tune_threshold_on_val(val_scores, val_labels, objective=objective)
+        if best_thresh is not None:
+            threshold_payload = {
+                "objective": objective,
+                "threshold": best_thresh,
+                "best_val_score": best_score,
+            }
+            derived_metrics["test_thresholded"] = compute_derived_binary_metrics(
+                test_scores,
+                test_labels,
+                threshold=best_thresh,
+            )
+            logger.info(
+                "Derived eval: tuned threshold on VAL only: t=%.4f objective=%s score=%.4f",
+                best_thresh,
+                objective,
+                best_score if best_score is not None else float("nan"),
+            )
+        else:
+            logger.warning("Derived eval: threshold tuning skipped (no valid VAL labels).")
+
+    logger.info(
+        "Derived eval: TEST AUROC=%s AUPRC=%s",
+        derived_metrics["test"].get("auroc"),
+        derived_metrics["test"].get("auprc"),
+    )
+
+    suffix = f"{prefix}_" if prefix else ""
+    preds_path = output_dir / f"{suffix}derived_predictions.csv"
+    with preds_path.open("w", encoding="utf-8") as f:
+        f.write("image_id,split,q_score,exp,icm,te,y_morph,y_hat,threshold_used,source\n")
+
+        def _write(split_name, derived, threshold):
+            for idx, score in enumerate(derived.get("q_score", [])):
+                label = derived.get("labels", [None])[idx] if idx < len(derived.get("labels", [])) else None
+                exp_val = derived.get("exp_used", [None])[idx] if idx < len(derived.get("exp_used", [])) else None
+                icm_val = derived.get("icm_used", [None])[idx] if idx < len(derived.get("icm_used", [])) else None
+                te_val = derived.get("te_used", [None])[idx] if idx < len(derived.get("te_used", [])) else None
+                source = derived.get("sources", [None])[idx] if idx < len(derived.get("sources", [])) else None
+                image_id = derived.get("image_id", [None])[idx] if idx < len(derived.get("image_id", [])) else None
+                y_hat = ""
+                if threshold is not None and label is not None:
+                    y_hat = "1" if score >= threshold else "0"
+                f.write(
+                    f"{image_id},{split_name},{score:.6f},{exp_val},{icm_val},{te_val},{label},{y_hat},{threshold},{source}\n"
+                )
+
+        _write("val", derived_val, threshold_payload["threshold"] if threshold_payload else None)
+        _write("test", derived_test, threshold_payload["threshold"] if threshold_payload else None)
+
+    derived_path = output_dir / f"{suffix}derived_eval.json"
+    payload = dict(derived_metrics)
+    if threshold_payload is not None:
+        payload["threshold"] = threshold_payload
+    with derived_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    logger.info("Derived eval saved to %s", derived_path)
+    logger.info("Derived predictions saved to %s", preds_path)
+    return payload
+
+
 def _load_predefined_splits(hung_cfg, df: pd.DataFrame):
     split_files = hung_cfg.get("split_files")
     if split_files:
@@ -280,6 +530,76 @@ def load_predefined_hv_splits(hung_cfg, df: pd.DataFrame, splits_base_dir: str, 
             return val_df, test_df, None
 
     return None, None, None
+
+
+def _resolve_in_domain_split_paths(cfg, blast_cfg, args, logger) -> tuple[Optional[Path], Path]:
+    val_path = None
+    test_path = None
+    if args.in_domain_val_csv or args.in_domain_test_csv:
+        if not args.in_domain_val_csv or not args.in_domain_test_csv:
+            raise ValueError("Provide both --in_domain_val_csv and --in_domain_test_csv.")
+        val_path = Path(args.in_domain_val_csv)
+        test_path = Path(args.in_domain_test_csv)
+        logger.info("Using in-domain split CSVs from CLI.")
+    else:
+        split_files = blast_cfg.get("split_files")
+        if split_files:
+            val_path = Path(split_files.get("val", ""))
+            test_path = Path(split_files.get("test", ""))
+            logger.info("Using in-domain split CSVs from blastocyst config.")
+        else:
+            split_dir = Path(cfg.data.splits_base_dir) / Path(cfg.data.blastocyst_config).stem
+            val_path = split_dir / "val.csv"
+            test_path = split_dir / "test.csv"
+            logger.info("Using in-domain split CSVs from %s.", split_dir)
+
+    if val_path is not None and not val_path.exists():
+        if args.in_domain_no_val:
+            logger.warning("Missing in-domain val split (%s); proceeding without VAL.", val_path)
+            val_path = None
+        else:
+            raise FileNotFoundError(f"Missing in-domain val split: {val_path}")
+    if not test_path.exists():
+        meta_path = Path(blast_cfg.get("csv_path", ""))
+        if meta_path.exists():
+            df = pd.read_csv(meta_path)
+            if "split" in df.columns:
+                logger.info("Using split column from %s for in-domain test.", meta_path)
+                val_path = meta_path
+                test_path = meta_path
+                return val_path, test_path
+        raise FileNotFoundError(
+            f"Missing in-domain test split: {test_path}. Provide --in_domain_test_csv or generate splits."
+        )
+    return val_path, test_path
+
+
+def _build_in_domain_q_dataset(
+    df: pd.DataFrame,
+    blast_cfg,
+    cfg,
+    q_weights: dict,
+    context: str,
+) -> BaseImageDataset:
+    include_meta_day = bool(blast_cfg.get("include_meta_day", cfg.data.include_meta_day_default))
+    records = _build_q_records(df, include_meta_day, context=context, q_weights=q_weights)
+    if not records:
+        raise ValueError(
+            "In-domain Q dataset has no usable records. Ensure exp/icm/te or Gardner grade are available."
+        )
+    eval_tf = get_eval_transforms(
+        image_size=cfg.transforms.image_size,
+        normalize=cfg.transforms.normalize,
+        mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
+        std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+    )
+    assert_no_augmentation(eval_tf)
+    return BaseImageDataset(
+        records,
+        transform=eval_tf,
+        include_meta_day=include_meta_day,
+        root_dir=str(blast_cfg.get("root_dir", "")),
+    )
 
 
 def _select_calibration_subset(prob_good, y_true, days, mode: str):
@@ -340,6 +660,16 @@ def _binary_metrics_block(y_true, y_pred, days) -> Dict[str, Dict[str, Optional[
     }
 
 
+def _drop_day3(metrics: dict) -> dict:
+    if not isinstance(metrics, dict):
+        return metrics
+    metrics.pop("day3", None)
+    binary = metrics.get("binary")
+    if isinstance(binary, dict):
+        binary.pop("day3", None)
+    return metrics
+
+
 def _predict_q(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -358,6 +688,7 @@ def _predict_q(
     grade_vals = []
     gardner_vals = []
     label_sources = []
+    q_proxy_vals = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -383,6 +714,7 @@ def _predict_q(
                 grade_meta = [m.get("grade") for m in meta]
                 gardner_meta = [m.get("gardner") for m in meta]
                 label_meta = [m.get("label_source") for m in meta]
+                q_proxy_meta = [m.get("q_proxy") for m in meta]
             elif isinstance(meta, dict):
                 ids = meta.get("id")
                 day_vals = meta.get("day")
@@ -393,6 +725,7 @@ def _predict_q(
                 grade_meta = meta.get("grade")
                 gardner_meta = meta.get("gardner")
                 label_meta = meta.get("label_source")
+                q_proxy_meta = meta.get("q_proxy")
             else:
                 ids = None
                 day_vals = None
@@ -403,6 +736,7 @@ def _predict_q(
                 grade_meta = None
                 gardner_meta = None
                 label_meta = None
+                q_proxy_meta = None
 
             if ids is None:
                 ids = [None] * len(q_pred)
@@ -422,6 +756,8 @@ def _predict_q(
                 gardner_meta = [None] * len(q_pred)
             if label_meta is None:
                 label_meta = [None] * len(q_pred)
+            if q_proxy_meta is None:
+                q_proxy_meta = [None] * len(q_pred)
             if not isinstance(day_vals, list):
                 day_vals = [day_vals] * len(q_pred)
             if not isinstance(domain_vals, list):
@@ -438,6 +774,8 @@ def _predict_q(
                 gardner_meta = [gardner_meta] * len(q_pred)
             if not isinstance(label_meta, list):
                 label_meta = [label_meta] * len(q_pred)
+            if not isinstance(q_proxy_meta, list):
+                q_proxy_meta = [q_proxy_meta] * len(q_pred)
 
             for i in range(len(q_pred)):
                 label_val = None
@@ -456,6 +794,7 @@ def _predict_q(
                 grade_vals.append(grade_meta[i])
                 gardner_vals.append(gardner_meta[i])
                 label_sources.append(label_meta[i])
+                q_proxy_vals.append(q_proxy_meta[i])
 
     return {
         "q_score": q_scores,
@@ -469,6 +808,7 @@ def _predict_q(
         "grade_raw": grade_vals,
         "gardner_raw": gardner_vals,
         "label_source": label_sources,
+        "q_proxy": q_proxy_vals,
     }
 
 
@@ -493,6 +833,18 @@ def _regression_metrics(scores, targets) -> Dict[str, Optional[float]]:
     rmse = float(np.sqrt(np.mean((scores_arr - targets_arr) ** 2)))
     spearman = _spearman_corr(scores_arr, targets_arr)
     return {"mae": mae, "rmse": rmse, "spearman": spearman}
+
+
+def _score_stats(scores: list[float]) -> Dict[str, Optional[float]]:
+    if not scores:
+        return {"mean": None, "std": None, "min": None, "max": None}
+    arr = np.array(scores, dtype=float)
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
 
 
 def _compute_q_proxy_values(preds: Dict[str, list], use_exp_cols: bool, weights: dict) -> Dict[str, list]:
@@ -536,6 +888,39 @@ def _compute_q_proxy_values(preds: Dict[str, list], use_exp_cols: bool, weights:
     }
 
 
+def _derive_quality_labels_from_preds(preds: Dict[str, list], cfg) -> list:
+    exp_min = int(getattr(getattr(cfg, "quality_exp", None), "exp_min", 3))
+    icm_good = set(getattr(getattr(cfg, "quality_exp", None), "icm_good", [1, 2]))
+    te_good = set(getattr(getattr(cfg, "quality_exp", None), "te_good", [1, 2]))
+    labels = []
+    for exp_raw, icm_raw, te_raw in zip(
+        preds.get("exp_raw", []),
+        preds.get("icm_raw", []),
+        preds.get("te_raw", []),
+    ):
+        exp_val = normalize_gardner_exp(exp_raw)
+        icm_val = normalize_gardner_grade(icm_raw)
+        te_val = normalize_gardner_grade(te_raw)
+        if exp_val is None or icm_val is None or te_val is None:
+            labels.append(None)
+            continue
+        label = 1 if exp_val >= exp_min and icm_val in icm_good and te_val in te_good else 0
+        labels.append(label)
+    return labels
+
+
+def _filter_binary_from_lists(scores, labels, days, domains) -> Dict[str, list]:
+    result = {"q_score": [], "y_true": [], "day": [], "domain": []}
+    for score, label, day, domain in zip(scores, labels, days, domains):
+        if label is None:
+            continue
+        result["q_score"].append(score)
+        result["y_true"].append(int(label))
+        result["day"].append(day)
+        result["domain"].append(domain)
+    return result
+
+
 def _filter_binary_preds(preds: Dict[str, list]) -> Dict[str, list]:
     scores = []
     labels = []
@@ -569,11 +954,32 @@ def _load_q_thresholds(reports_dir: Path, logger) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _normalize_state_dict_keys(state_dict: dict) -> dict:
+    prefixes = ("module.", "model.")
+    normalized = state_dict
+    updated = True
+    while updated:
+        updated = False
+        for prefix in prefixes:
+            if any(k.startswith(prefix) for k in normalized.keys()):
+                normalized = {
+                    k[len(prefix) :] if k.startswith(prefix) else k: v for k, v in normalized.items()
+                }
+                updated = True
+    return normalized
+
+
+def _q_head_in_features(model: MultiTaskEmbryoNet) -> int | None:
+    for module in model.q_head.modules():
+        if isinstance(module, nn.Linear):
+            return int(module.in_features)
+    return None
+
+
 def load_checkpoint(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=None) -> None:
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     state_dict = ckpt.get("state_dict", ckpt)
-    if any(k.startswith("model.") for k in state_dict.keys()):
-        state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
+    state_dict = _normalize_state_dict_keys(state_dict)
     current = model.state_dict()
     filtered = {}
     skipped_shape = []
@@ -621,8 +1027,7 @@ def load_checkpoint_filtered(
 ) -> None:
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     state_dict = ckpt.get("state_dict", ckpt)
-    if any(k.startswith("model.") for k in state_dict.keys()):
-        state_dict = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
+    state_dict = _normalize_state_dict_keys(state_dict)
     current = model.state_dict()
     filtered = {}
     skipped_shape = []
@@ -671,11 +1076,416 @@ def load_checkpoint_filtered(
             print(f"Warning: skipped prefix keys (first 5): {skipped_prefix[:5]}")
 
 
+def load_q_head_strict(model: MultiTaskEmbryoNet, checkpoint_path: Path, logger=None) -> dict:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+    state_dict = _normalize_state_dict_keys(state_dict)
+
+    q_state = {}
+    for key, value in state_dict.items():
+        if key.startswith("q_head."):
+            q_state[key[len("q_head.") :]] = value
+
+    total_keys = len(state_dict)
+    skipped_prefix = [k for k in state_dict.keys() if not k.startswith("q_head.")]
+    expected = model.q_head.state_dict()
+    missing = [k for k in expected.keys() if k not in q_state]
+    unexpected = [k for k in q_state.keys() if k not in expected]
+    mismatched = []
+    matched = 0
+    for key, exp_val in expected.items():
+        if key not in q_state:
+            continue
+        loaded_val = q_state[key]
+        if exp_val.shape != loaded_val.shape:
+            mismatched.append((key, tuple(exp_val.shape), tuple(loaded_val.shape)))
+        else:
+            matched += 1
+
+    if logger:
+        logger.info(
+            "Checkpoint load summary: total=%s matched=%s missing=%s unexpected=%s skipped_mismatch=%s skipped_prefix=%s",
+            total_keys,
+            matched,
+            len(missing),
+            len(unexpected),
+            len(mismatched),
+            len(skipped_prefix),
+        )
+        if missing:
+            logger.warning("Missing keys (first 5): %s", missing[:5])
+        if unexpected:
+            logger.warning("Unexpected keys (first 5): %s", unexpected[:5])
+        if mismatched:
+            logger.warning("Skipped mismatched keys (first 5): %s", [m[0] for m in mismatched[:5]])
+        if skipped_prefix:
+            logger.warning("Skipped prefix keys (first 5): %s", skipped_prefix[:5])
+
+    if not q_state:
+        raise RuntimeError(
+            "Q-head checkpoint load failed: no q_head.* keys found. "
+            "Use the Phase-4 Q checkpoint that matches the training config."
+        )
+
+    if missing or unexpected or mismatched:
+        mismatch_preview = [f"{k} expected={exp} got={got}" for k, exp, got in mismatched[:5]]
+        raise RuntimeError(
+            "Q-head checkpoint load failed due to key/shape mismatch. "
+            f"Missing keys: {missing[:5]} Unexpected keys: {unexpected[:5]} "
+            f"Mismatched shapes: {mismatch_preview}. "
+            "Your eval config backbone/out_dim/q_head hidden dim differs from training. "
+            "Use the same config as Phase-4Q training."
+        )
+
+    encoder_out_dim = getattr(model.encoder, "out_dim", None)
+    q_head_in_dim = _q_head_in_features(model)
+    if encoder_out_dim is not None and q_head_in_dim is not None and int(encoder_out_dim) != int(q_head_in_dim):
+        raise RuntimeError(
+            "Q-head input dim does not match encoder out_dim. "
+            f"encoder_out_dim={encoder_out_dim} q_head_in_dim={q_head_in_dim}. "
+            "Check backbone config and Q checkpoint."
+        )
+
+    model.q_head.load_state_dict(q_state, strict=True)
+    expected_params = sum(p.numel() for p in model.q_head.parameters())
+    loaded_params = sum(v.numel() for v in q_state.values())
+    if logger:
+        logger.info(
+            "Q head load ok: expected_params=%s loaded_params=%s encoder_out_dim=%s q_head_in_dim=%s q_head_load_ok=True",
+            expected_params,
+            loaded_params,
+            encoder_out_dim,
+            q_head_in_dim,
+        )
+    return {
+        "expected_params": expected_params,
+        "loaded_params": loaded_params,
+        "encoder_out_dim": encoder_out_dim,
+        "q_head_in_dim": q_head_in_dim,
+    }
+
+
+def run_in_domain_q_eval(cfg, args, logger, device) -> None:
+    """
+    In-domain Phase-4 Q-score evaluation.
+
+    - Uses in-domain VAL/TEST splits to compute regression/rank metrics.
+    - Calibrates any threshold on VAL only, then applies to TEST (no leakage).
+    - Correlation/regression are primary; thresholded metrics are optional.
+    """
+    if not bool(getattr(cfg.model, "use_q_score", False)):
+        logger.warning("In-domain Q eval skipped because use_q_score=false.")
+        return
+    logger.info("[IN-DOMAIN] Phase-4 Q-score evaluation")
+    blast_cfg = OmegaConf.load(cfg.data.blastocyst_config)
+    val_path, test_path = _resolve_in_domain_split_paths(cfg, blast_cfg, args, logger)
+    train_df = None
+    if val_path is not None and test_path == val_path and val_path == Path(blast_cfg.get("csv_path", "")):
+        df = pd.read_csv(test_path)
+        if "split" not in df.columns:
+            raise ValueError("In-domain metadata split requested but 'split' column missing.")
+        split_col = df["split"].astype(str).str.lower()
+        val_df = df[split_col.isin({"val", "valid", "validation"})].copy()
+        test_df = df[split_col == "test"].copy()
+        train_df = df[split_col == "train"].copy()
+    else:
+        val_df = pd.read_csv(val_path) if val_path is not None else pd.DataFrame()
+        test_df = pd.read_csv(test_path)
+
+    if args.day5_only:
+        day_col = blast_cfg.get("day_col")
+        if train_df is not None:
+            train_df = _apply_day5_filter(train_df, day_col, logger, "in_domain_train")
+        if not val_df.empty:
+            val_df = _apply_day5_filter(val_df, day_col, logger, "in_domain_val")
+        test_df = _apply_day5_filter(test_df, day_col, logger, "in_domain_test")
+
+    if test_df.empty:
+        raise ValueError("In-domain test split is empty; cannot evaluate.")
+
+    id_col = blast_cfg.get("id_col")
+    split_ids = {"test": sorted(_split_ids(test_df, id_col))}
+    if not val_df.empty:
+        split_ids["val"] = sorted(_split_ids(val_df, id_col))
+    split_signature = hashlib.md5(json.dumps(split_ids, sort_keys=True).encode("utf-8")).hexdigest()
+
+    q_cfg = getattr(cfg.training, "q", None)
+    q_weights = dict(getattr(q_cfg, "q_weights", {}) or {})
+
+    val_dataset = None
+    if not val_df.empty:
+        val_dataset = _build_in_domain_q_dataset(
+            val_df,
+            blast_cfg,
+            cfg,
+            q_weights,
+            context="in_domain_q_val",
+        )
+    test_dataset = _build_in_domain_q_dataset(
+        test_df,
+        blast_cfg,
+        cfg,
+        q_weights,
+        context="in_domain_q_test",
+    )
+    logger.info(
+        "In-domain Q eval sizes: val=%s test=%s",
+        len(val_dataset) if val_dataset is not None else 0,
+        len(test_dataset),
+    )
+
+    q_ckpt_path = args.q_checkpoint or args.checkpoint or (Path(cfg.outputs.checkpoints_dir) / "phase4_q.ckpt")
+    q_ckpt_path = Path(q_ckpt_path)
+    if not q_ckpt_path.exists():
+        raise FileNotFoundError(f"Q checkpoint not found: {q_ckpt_path}")
+
+    q_model = build_model(cfg)
+    encoder_source = None
+    if args.checkpoint:
+        encoder_ckpt = Path(args.checkpoint)
+        if not encoder_ckpt.exists():
+            raise FileNotFoundError(f"Backbone checkpoint not found: {encoder_ckpt}")
+        logger.info("Loading encoder weights from %s", encoder_ckpt)
+        load_checkpoint(q_model, encoder_ckpt, logger=logger)
+        encoder_source = str(encoder_ckpt)
+    else:
+        logger.info("Loading encoder weights from %s", q_ckpt_path)
+        load_checkpoint(q_model, q_ckpt_path, logger=logger)
+        encoder_source = str(q_ckpt_path)
+
+    logger.info("Loading Q head weights from %s (q_head only)", q_ckpt_path)
+    load_q_head_strict(q_model, q_ckpt_path, logger=logger)
+    logger.info("In-domain Q init summary: encoder=%s q_head=%s", encoder_source, q_ckpt_path)
+    q_model.to(device)
+
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            collate_fn=collate_batch,
+        )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        collate_fn=collate_batch,
+    )
+
+    q_preds_val = _predict_q(q_model, val_loader, device, include_unlabeled=True) if val_loader else {}
+    q_preds_test = _predict_q(q_model, test_loader, device, include_unlabeled=True)
+
+    def _resolve_proxy(preds, df, context):
+        proxy_vals = preds.get("q_proxy", [])
+        if proxy_vals and any(val is not None for val in proxy_vals):
+            return proxy_vals, "meta"
+        use_exp_cols = all(col in df.columns for col in ("exp", "icm", "te"))
+        proxy = _compute_q_proxy_values(preds, use_exp_cols, q_weights)
+        proxy_vals = proxy["q_proxy"]
+        if not proxy_vals or all(val is None for val in proxy_vals):
+            raise ValueError(
+                f"In-domain Q eval requires exp/icm/te or Gardner grade to compute q_proxy ({context})."
+            )
+        return proxy_vals, "computed"
+
+    val_proxy = []
+    val_proxy_source = "none"
+    if not val_df.empty:
+        val_proxy, val_proxy_source = _resolve_proxy(q_preds_val, val_df, "val")
+    test_proxy, test_proxy_source = _resolve_proxy(q_preds_test, test_df, "test")
+
+    def _collect_proxy_pairs(preds, proxy_vals):
+        scores = []
+        targets = []
+        for score, proxy_val in zip(preds.get("q_score", []), proxy_vals):
+            if proxy_val is None:
+                continue
+            scores.append(score)
+            targets.append(proxy_val)
+        return scores, targets
+
+    val_scores, val_targets = _collect_proxy_pairs(q_preds_val, val_proxy) if val_proxy else ([], [])
+    test_scores, test_targets = _collect_proxy_pairs(q_preds_test, test_proxy)
+
+    proxy_val_metrics = _regression_metrics(val_scores, val_targets)
+    proxy_test_metrics = _regression_metrics(test_scores, test_targets)
+
+    q_metrics = {
+        "dataset": blast_cfg.get("dataset_type", "blastocyst"),
+        "split_signature": split_signature,
+        "counts": {
+            "train": len(train_df) if train_df is not None else 0,
+            "val": len(val_dataset) if val_dataset is not None else 0,
+            "test": len(test_dataset),
+        },
+        "proxy_regression": {"val": proxy_val_metrics, "test": proxy_test_metrics},
+        "proxy_source": {"val": val_proxy_source, "test": test_proxy_source},
+        "q_score_stats": {
+            "val": _score_stats(q_preds_val.get("q_score", [])) if q_preds_val else {"mean": None, "std": None, "min": None, "max": None},
+            "test": _score_stats(q_preds_test.get("q_score", [])),
+        },
+    }
+    output_dir = ensure_outputs_dir(args.output_dir or cfg.outputs.reports_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    derived_cfg = getattr(cfg, "derived_eval", None)
+    derived_thresholded = bool(args.derived_thresholded) or bool(getattr(derived_cfg, "thresholded", False))
+    derived_payload = _run_derived_eval(
+        q_preds_val or {},
+        q_preds_test,
+        derived_cfg,
+        output_dir,
+        derived_thresholded,
+        args.derived_objective,
+        logger,
+        prefix="",
+    )
+    if derived_payload is not None:
+        q_metrics["derived_eval"] = derived_payload
+    labeled_val = _filter_binary_preds(q_preds_val) if q_preds_val else {"q_score": [], "y_true": [], "day": [], "domain": []}
+    labeled_test = _filter_binary_preds(q_preds_test)
+    derived_val = []
+    derived_test = []
+    auto_derive = bool(getattr(cfg.quality_exp, "derive_quality", False)) and not labeled_test["y_true"]
+    if (args.derive_quality_from_morph or auto_derive) and not labeled_test["y_true"]:
+        derived_val = _derive_quality_labels_from_preds(q_preds_val, cfg) if q_preds_val else []
+        derived_test = _derive_quality_labels_from_preds(q_preds_test, cfg)
+        labeled_val = _filter_binary_from_lists(
+            q_preds_val.get("q_score", []),
+            derived_val,
+            q_preds_val.get("day", []),
+            q_preds_val.get("domain", []),
+        )
+        labeled_test = _filter_binary_from_lists(
+            q_preds_test.get("q_score", []),
+            derived_test,
+            q_preds_test.get("day", []),
+            q_preds_test.get("domain", []),
+        )
+        logger.info(
+            "Derived quality labels from morphology for in-domain eval: val_labeled=%s test_labeled=%s",
+            len(labeled_val["y_true"]),
+            len(labeled_test["y_true"]),
+        )
+    if args.derive_quality_from_morph or auto_derive:
+        q_metrics["quality_label_source"] = "derived_morph"
+    if labeled_test["y_true"]:
+        rank_overall = compute_metrics(labeled_test["q_score"], labeled_test["y_true"])
+        day3_probs, day3_true = slice_by_day(
+            {"prob_good": labeled_test["q_score"], "y_true": labeled_test["y_true"], "day": labeled_test["day"]},
+            3,
+        )
+        day5_probs, day5_true = slice_by_day(
+            {"prob_good": labeled_test["q_score"], "y_true": labeled_test["y_true"], "day": labeled_test["day"]},
+            5,
+        )
+        q_metrics["rank"] = {
+            "overall": {"auroc": rank_overall.get("auroc"), "auprc": rank_overall.get("auprc")},
+            "day3": {"auroc": compute_metrics(day3_probs, day3_true).get("auroc"), "auprc": compute_metrics(day3_probs, day3_true).get("auprc")},
+            "day5": {"auroc": compute_metrics(day5_probs, day5_true).get("auroc"), "auprc": compute_metrics(day5_probs, day5_true).get("auprc")},
+        }
+
+    threshold_calibrated = None
+    threshold_f1 = None
+    if args.also_report_thresholded and labeled_val["y_true"] and labeled_test["y_true"]:
+        cal_scores, cal_true = _select_calibration_subset(
+            labeled_val["q_score"],
+            labeled_val["y_true"],
+            labeled_val["day"],
+            args.calibrate_stage,
+        )
+        if cal_scores:
+            tuned_thresh, tuned_f1 = _tune_threshold(cal_scores, cal_true)
+            if tuned_thresh is not None:
+                threshold_calibrated = float(tuned_thresh)
+                threshold_f1 = tuned_f1
+                test_preds = [1 if score >= threshold_calibrated else 0 for score in labeled_test["q_score"]]
+                q_metrics["thresholded"] = {
+                    "method": "threshold",
+                    "threshold": threshold_calibrated,
+                    "stage": args.calibrate_stage,
+                    "f1_val": tuned_f1,
+                    **_binary_metrics_block(labeled_test["y_true"], test_preds, labeled_test["day"]),
+                }
+                if args.day5_only:
+                    q_metrics["thresholded"] = _drop_day3(q_metrics["thresholded"])
+        else:
+            logger.warning("In-domain Q calibration subset is empty; skipping thresholded metrics.")
+    elif args.also_report_thresholded:
+        logger.warning("Thresholded metrics disabled: missing VAL labels for calibration.")
+
+    metrics_path = output_dir / "in_domain_q_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(q_metrics, f, indent=2)
+    phase4_metrics_path = output_dir / "phase4_q_in_domain_metrics.json"
+    with phase4_metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(q_metrics, f, indent=2)
+
+    def _write_preds(path: Path, split_name: str, preds: Dict[str, list], proxies: list, derived_labels: list):
+        with path.open("w", encoding="utf-8") as f:
+            f.write("image_id,split,q_score,q_proxy,quality_label,quality_label_derived,y_hat\n")
+            for idx, (image_id, score, label) in enumerate(
+                zip(preds.get("image_id", []), preds.get("q_score", []), preds.get("y_true", []))
+            ):
+                proxy_val = proxies[idx] if idx < len(proxies) else None
+                proxy_str = "" if proxy_val is None else f"{proxy_val:.6f}"
+                label_str = "" if label is None else str(label)
+                derived_label = "" if idx >= len(derived_labels) or derived_labels[idx] is None else str(derived_labels[idx])
+                y_hat = ""
+                if threshold_calibrated is not None:
+                    y_hat = "1" if score >= threshold_calibrated else "0"
+                f.write(
+                    f"{image_id},{split_name},{score:.6f},{proxy_str},{label_str},{derived_label},{y_hat}\n"
+                )
+
+    preds_path = output_dir / "in_domain_q_predictions.csv"
+    with preds_path.open("w", encoding="utf-8") as f:
+        f.write("image_id,split,q_score,q_proxy,quality_label,quality_label_derived,y_hat\n")
+        for split_name, preds, proxies, derived_labels in (
+            ("val", q_preds_val, val_proxy, derived_val),
+            ("test", q_preds_test, test_proxy, derived_test),
+        ):
+            if not preds:
+                continue
+            for idx, (image_id, score, label) in enumerate(
+                zip(preds.get("image_id", []), preds.get("q_score", []), preds.get("y_true", []))
+            ):
+                proxy_val = proxies[idx] if idx < len(proxies) else None
+                proxy_str = "" if proxy_val is None else f"{proxy_val:.6f}"
+                label_str = "" if label is None else str(label)
+                derived_label = "" if idx >= len(derived_labels) or derived_labels[idx] is None else str(derived_labels[idx])
+                y_hat = ""
+                if threshold_calibrated is not None:
+                    y_hat = "1" if score >= threshold_calibrated else "0"
+                f.write(
+                    f"{image_id},{split_name},{score:.6f},{proxy_str},{label_str},{derived_label},{y_hat}\n"
+                )
+
+    if q_preds_val:
+        _write_preds(output_dir / "phase4_q_predictions_val.csv", "val", q_preds_val, val_proxy, derived_val)
+    _write_preds(output_dir / "phase4_q_predictions_test.csv", "test", q_preds_test, test_proxy, derived_test)
+
+    threshold_payload = {
+        "computed": threshold_calibrated is not None,
+        "method": "threshold" if threshold_calibrated is not None else None,
+        "threshold": threshold_calibrated,
+        "stage": args.calibrate_stage,
+        "f1_val": threshold_f1,
+    }
+    thresholds_path = output_dir / "phase4_q_thresholds.json"
+    with thresholds_path.open("w", encoding="utf-8") as f:
+        json.dump(threshold_payload, f, indent=2)
+
+    logger.info("Saved in-domain q metrics to %s", metrics_path)
+    logger.info("Saved in-domain q predictions to %s", preds_path)
+
+
 def main():
     args = parse_args()
     cfg = load_experiment_config(args.config)
-    if args.q_only:
-        args.eval_q = True
+    use_q_score = bool(getattr(cfg.model, "use_q_score", False))
     if args.tune_day5_threshold:
         args.analysis_oracle_day5_threshold = True
     if args.seed is not None:
@@ -689,10 +1499,37 @@ def main():
     logs_dir = ensure_outputs_dir(cfg.outputs.logs_dir)
     logger = configure_logging(logs_dir / "train.log")
     logger.info("Seed=%s", cfg.seed)
-    if not args.q_only:
+    if not args.q_only and not args.eval_in_domain_q:
         logger.info("[EXP-5A] Cross-domain evaluation - Phase-3 Quality")
     if args.tune_day5_threshold:
         logger.info("Using --tune_day5_threshold as analysis_oracle_day5_threshold.")
+
+    if args.check_q_compat:
+        q_ckpt_path = args.q_checkpoint or (Path(cfg.outputs.checkpoints_dir) / "phase4_q.ckpt")
+        q_ckpt_path = Path(q_ckpt_path)
+        if not q_ckpt_path.exists():
+            raise FileNotFoundError(f"Q checkpoint not found: {q_ckpt_path}")
+        q_model = build_model(cfg)
+        if args.checkpoint:
+            backbone_ckpt = Path(args.checkpoint)
+            if not backbone_ckpt.exists():
+                raise FileNotFoundError(f"Backbone checkpoint not found: {backbone_ckpt}")
+            logger.info("Loading backbone checkpoint weights from %s", backbone_ckpt)
+            load_checkpoint(q_model, backbone_ckpt, logger=logger)
+        logger.info("Validating Q head weights from %s", q_ckpt_path)
+        load_q_head_strict(q_model, q_ckpt_path, logger=logger)
+        logger.info("Q compatibility check passed.")
+        return
+
+    device_str = str(args.device or cfg.device or "cpu")
+    device = torch.device(device_str)
+    if "cuda" in device_str and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available; using CPU.")
+        device = torch.device("cpu")
+
+    if args.eval_in_domain_q:
+        run_in_domain_q_eval(cfg, args, logger, device)
+        return
 
     data_cfg = cfg.data
     hung_cfg_path = data_cfg.hungvuong_config
@@ -730,6 +1567,10 @@ def main():
 
     if val_df is None or test_df is None:
         raise ValueError("Failed to create HV val/test splits.")
+    if args.day5_only:
+        day_col = hung_cfg.get("day_col")
+        val_df = _apply_day5_filter(val_df, day_col, logger, "hv_val")
+        test_df = _apply_day5_filter(test_df, day_col, logger, "hv_test")
     logger.info("HV split sizes: val=%s test=%s", len(val_df), len(test_df))
     id_col = hung_cfg.get("id_col")
     split_ids = {
@@ -741,12 +1582,6 @@ def main():
     output_dir = ensure_outputs_dir(args.output_dir or cfg.outputs.reports_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    device_str = str(args.device or cfg.device or "cpu")
-    device = torch.device(device_str)
-    if "cuda" in device_str and not torch.cuda.is_available():
-        logger.warning("CUDA requested but not available; using CPU.")
-        device = torch.device("cpu")
-
     if args.q_only:
         logger.info("Q-only evaluation: skipping Phase-3 quality metrics.")
 
@@ -756,10 +1591,15 @@ def main():
 
     if not args.q_only:
         model = build_model(cfg)
-        checkpoint_path = args.checkpoint or Path(cfg.outputs.checkpoints_dir) / "phase4_quality.ckpt"
+        checkpoint_path = args.checkpoint or Path(cfg.outputs.checkpoints_dir) / "phase3_quality.ckpt"
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            legacy_path = Path(cfg.outputs.checkpoints_dir) / "phase4_quality.ckpt"
+            if legacy_path.exists():
+                logger.warning("Quality checkpoint not found at %s; falling back to %s.", checkpoint_path, legacy_path)
+                checkpoint_path = legacy_path
+            else:
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         if args.dry_run:
             logger.info("Dry run: checkpoint found at %s", checkpoint_path)
             return
@@ -835,19 +1675,20 @@ def main():
             threshold=source_threshold,
         )
 
-        metrics = {
-            "zero_shot": {
-                "threshold_source": source_threshold,
-                "overall": zero_overall,
-                "day3": zero_day3,
-                "day5": zero_day5,
-                "binary": _binary_metrics_block(
-                    preds_test["y_true"],
-                    [1 if prob >= source_threshold else 0 for prob in preds_test["prob_good"]],
-                    preds_test["day"],
-                ),
-            }
+        zero_block = {
+            "threshold_source": source_threshold,
+            "overall": zero_overall,
+            "day3": zero_day3,
+            "day5": zero_day5,
+            "binary": _binary_metrics_block(
+                preds_test["y_true"],
+                [1 if prob >= source_threshold else 0 for prob in preds_test["prob_good"]],
+                preds_test["day"],
+            ),
         }
+        if args.day5_only:
+            zero_block = _drop_day3(zero_block)
+        metrics = {"zero_shot": zero_block}
         metrics["split_signature"] = split_signature
 
         calibrated_block = None
@@ -883,6 +1724,8 @@ def main():
                             preds_test["day"],
                         ),
                     }
+                    if args.day5_only:
+                        calibrated_block = _drop_day3(calibrated_block)
             elif args.calibrate_mode == "temperature":
                 tuned_temp = _tune_temperature(cal_probs, cal_true)
                 if tuned_temp is not None:
@@ -907,6 +1750,8 @@ def main():
                             preds_test["day"],
                         ),
                     }
+                    if args.day5_only:
+                        calibrated_block = _drop_day3(calibrated_block)
 
         if calibrated_block:
             metrics["calibrated"] = calibrated_block
@@ -921,13 +1766,16 @@ def main():
                     preds_test["day"],
                     threshold=tuned_thresh,
                 )
-                metrics["analysis_oracle"] = {
+                oracle_block = {
                     "threshold": tuned_thresh,
                     "f1_day5": tuned_f1,
                     "overall": oracle_overall,
                     "day3": oracle_day3,
                     "day5": oracle_day5,
                 }
+                if args.day5_only:
+                    oracle_block = _drop_day3(oracle_block)
+                metrics["analysis_oracle"] = oracle_block
 
         if args.analysis_morph_rule and "morph_pred" in preds_test:
             exp_vals = [EXPANSION_CLASSES[idx] for idx in preds_test["morph_pred"]["exp"]]
@@ -943,11 +1791,14 @@ def main():
                 preds_test["day"],
                 threshold=0.5,
             )
-            metrics["analysis_morph_rule"] = {
+            morph_block = {
                 "overall": rule_overall,
                 "day3": rule_day3,
                 "day5": rule_day5,
             }
+            if args.day5_only:
+                morph_block = _drop_day3(morph_block)
+            metrics["analysis_morph_rule"] = morph_block
         metrics_path = output_dir / "external_quality_metrics.json"
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
@@ -995,14 +1846,18 @@ def main():
         q_ckpt_path = args.q_checkpoint or (Path(cfg.outputs.checkpoints_dir) / "phase4_q.ckpt")
         q_ckpt_path = Path(q_ckpt_path)
         if not q_ckpt_path.exists():
+            if args.q_only:
+                raise FileNotFoundError(f"Q checkpoint not found: {q_ckpt_path}")
             logger.warning("Q checkpoint not found: %s; skipping q eval.", q_ckpt_path)
             return
         q_model = build_model(cfg)
         backbone_ckpt = None
         if args.q_only:
-            if not args.checkpoint:
-                raise ValueError("--checkpoint is required for --q_only to load encoder weights.")
-            backbone_ckpt = Path(args.checkpoint)
+            if args.checkpoint:
+                backbone_ckpt = Path(args.checkpoint)
+            else:
+                backbone_ckpt = q_ckpt_path
+                logger.info("No --checkpoint provided for q_only; using q_checkpoint for encoder weights.")
         elif args.checkpoint:
             backbone_ckpt = Path(args.checkpoint)
 
@@ -1017,7 +1872,7 @@ def main():
             logger.warning("No backbone checkpoint provided for Q eval; encoder left at init.")
 
         logger.info("Loading Q head weights from %s (q_head only)", q_ckpt_path)
-        load_checkpoint_filtered(q_model, q_ckpt_path, allow_prefixes=["q_head."], logger=logger)
+        load_q_head_strict(q_model, q_ckpt_path, logger=logger)
         logger.info("Q init summary: encoder=%s q_head=%s", encoder_source, q_ckpt_path)
         q_model.to(device)
 
@@ -1091,6 +1946,20 @@ def main():
             }
         }
         q_metrics["split_signature"] = split_signature
+        derived_cfg = getattr(cfg, "derived_eval", None)
+        derived_thresholded = bool(args.derived_thresholded) or bool(getattr(derived_cfg, "thresholded", False))
+        derived_payload = _run_derived_eval(
+            q_preds_val,
+            q_preds_test,
+            derived_cfg,
+            output_dir,
+            derived_thresholded,
+            args.derived_objective,
+            logger,
+            prefix="",
+        )
+        if derived_payload is not None:
+            q_metrics["derived_eval"] = derived_payload
 
         labeled_test = _filter_binary_preds(q_preds_test)
         labeled_val = _filter_binary_preds(q_preds_val)
@@ -1114,6 +1983,8 @@ def main():
             )
             if not cal_scores:
                 logger.warning("Q calibration subset is empty; skipping calibration.")
+            elif len(set(cal_scores)) < 2:
+                logger.warning("Q calibration scores are constant; skipping calibration.")
             else:
                 tuned_thresh, tuned_f1 = _tune_threshold(cal_scores, cal_true)
                 if tuned_thresh is not None:
@@ -1143,11 +2014,19 @@ def main():
             )
             q_day3_rank = compute_metrics(q_day3_probs, q_day3_true)
             q_day5_rank = compute_metrics(q_day5_probs, q_day5_true)
+            q_metrics["rank"] = {
+                "overall": {"auroc": q_overall.get("auroc"), "auprc": q_overall.get("auprc")},
+                "day3": {"auroc": q_day3_rank.get("auroc"), "auprc": q_day3_rank.get("auprc")},
+                "day5": {"auroc": q_day5_rank.get("auroc"), "auprc": q_day5_rank.get("auprc")},
+            }
             q_metrics["binary_rank"] = {
                 "overall": {"auroc": q_overall.get("auroc"), "auprc": q_overall.get("auprc")},
                 "day3": {"auroc": q_day3_rank.get("auroc"), "auprc": q_day3_rank.get("auprc")},
                 "day5": {"auroc": q_day5_rank.get("auroc"), "auprc": q_day5_rank.get("auprc")},
             }
+            if args.day5_only:
+                q_metrics["rank"].pop("day3", None)
+                q_metrics["binary_rank"].pop("day3", None)
 
             labels_labeled = []
             pred_source_labeled = []

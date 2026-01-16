@@ -8,10 +8,10 @@ from typing import Dict, List, Optional
 
 @dataclass
 class EncoderConfig:
-    name: str = "convnext_mini"
+    name: str = "embryonet_lite"
     in_channels: int = 3
     dims: List[int] = field(default_factory=lambda: [32, 64, 128])
-    feature_dim: int = 256
+    feature_dim: int = 512
     weights_path: Optional[str] = None
     width_mult: float = 1.0
     use_head_conv: bool = True
@@ -26,6 +26,7 @@ class EncoderConfig:
 class HeadsConfig:
     quality_mode: str = "concat"
     quality_conditioning: str = "morph+stage"
+    q_head_hidden_dim: Optional[int] = None
 
 
 @dataclass
@@ -34,6 +35,8 @@ class ModelConfig:
     heads: HeadsConfig = field(default_factory=HeadsConfig)
     encoder_config: Optional[str] = None
     heads_config: Optional[str] = None
+    use_stage: bool = True
+    use_q_score: bool = False
 
 
 @dataclass
@@ -44,6 +47,8 @@ class DataConfig:
     hungvuong_config: str = "configs/data/hungvuong.yaml"
     splits_base_dir: str = "data/processed/splits"
     include_meta_day_default: bool = True
+    day_filter: Optional[List[int]] = None
+    only_day5: bool = False
 
 
 @dataclass
@@ -117,6 +122,10 @@ class QTrainingConfig:
     freeze_backbone: bool = True
     aux_alpha: float = 0.0
     unfreeze_last_n_blocks: int = 0
+    ranking_loss: bool = False
+    ranking_weight: float = 0.1
+    ranking_margin: float = 0.05
+    ranking_pairs: int = 256
 
 
 @dataclass
@@ -148,6 +157,15 @@ class QualityExpConfig:
 
 
 @dataclass
+class DerivedEvalConfig:
+    exp_min: int = 3
+    icm_good: List[int] = field(default_factory=lambda: [1, 2])
+    te_good: List[int] = field(default_factory=lambda: [1, 2])
+    thresholded: bool = False
+    objective: str = "f1"
+
+
+@dataclass
 class BaselineBinaryConfig:
     dataset_config: str = "configs/data/target.yaml"
     split_dir: Optional[str] = None
@@ -176,5 +194,6 @@ class ExperimentConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     outputs: OutputConfig = field(default_factory=OutputConfig)
     quality_exp: QualityExpConfig = field(default_factory=QualityExpConfig)
+    derived_eval: DerivedEvalConfig = field(default_factory=DerivedEvalConfig)
     baseline: BaselineBinaryConfig = field(default_factory=BaselineBinaryConfig)
     base_config: Optional[str] = None
