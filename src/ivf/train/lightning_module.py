@@ -25,16 +25,28 @@ from ivf.utils.logging import get_logger
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
         self.decay = decay
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self.shadow = {}
+        for k, v in model.state_dict().items():
+            if torch.is_floating_point(v) or torch.is_complex(v):
+                self.shadow[k] = v.detach().clone()
 
     def update(self, model: nn.Module) -> None:
         with torch.no_grad():
             for k, v in model.state_dict().items():
-                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+                if k not in self.shadow:
+                    continue
+                if not (torch.is_floating_point(v) or torch.is_complex(v)):
+                    continue
+                shadow = self.shadow[k]
+                value = v.detach()
+                if value.dtype != shadow.dtype:
+                    value = value.to(dtype=shadow.dtype)
+                shadow.mul_(self.decay).add_(value, alpha=1.0 - self.decay)
 
     def apply_to(self, model: nn.Module):
         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict(self.shadow, strict=False)
+        if self.shadow:
+            model.load_state_dict(self.shadow, strict=False)
         return backup
 
     def restore(self, model: nn.Module, backup) -> None:
