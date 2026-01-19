@@ -1069,7 +1069,7 @@ def main():
         cfg.model.heads.quality_conditioning = "none"
 
     model = build_model(cfg, phase=phase)
-    logger.info("Quality conditioning mode: %s", model.quality_conditioning)
+    logger.info("Quality conditioning mode: %s", getattr(model, "quality_conditioning", "n/a"))
     phase_cfg = cfg.training
     loss_weights = resolve_config_dict(phase_cfg.loss_weights)
     if phase == "morph":
