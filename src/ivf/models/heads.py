@@ -16,7 +16,14 @@ class MorphologyHeads(nn.Module):
     Three parallel classifiers for EXP, ICM, TE.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int = 0) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 0,
+        exp_classes: Optional[int] = None,
+        icm_classes: Optional[int] = None,
+        te_classes: Optional[int] = None,
+    ) -> None:
         super().__init__()
         def _make_head(num_classes: int):
             if hidden_dim > 0:
@@ -27,9 +34,13 @@ class MorphologyHeads(nn.Module):
                 )
             return nn.Linear(in_dim, num_classes)
 
-        self.exp = _make_head(len(EXPANSION_CLASSES))
-        self.icm = _make_head(len(ICM_CLASSES))
-        self.te = _make_head(len(TE_CLASSES))
+        exp_classes = len(EXPANSION_CLASSES) if exp_classes is None else exp_classes
+        icm_classes = len(ICM_CLASSES) if icm_classes is None else icm_classes
+        te_classes = len(TE_CLASSES) if te_classes is None else te_classes
+
+        self.exp = _make_head(exp_classes)
+        self.icm = _make_head(icm_classes)
+        self.te = _make_head(te_classes)
 
     def forward(self, features: torch.Tensor):
         return {

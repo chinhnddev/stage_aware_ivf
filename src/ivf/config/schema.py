@@ -22,6 +22,7 @@ class HeadsConfig:
 
 @dataclass
 class ModelConfig:
+    name: str = "multitask"
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     heads: HeadsConfig = field(default_factory=HeadsConfig)
     encoder_config: Optional[str] = None
@@ -46,6 +47,9 @@ class TransformConfig:
     joint: str = "light"
     quality: str = "light"
     q: str = "light"
+    crop_size: Optional[int] = None
+    rotation_degrees: float = 15.0
+    enable_vertical_flip: bool = False
     normalize: bool = False
     mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
@@ -63,6 +67,23 @@ class MorphTrainingConfig:
     class_weight_mode: str = "inverse_freq"
     balance_icm_te: bool = False
     labeled_mix_ratio: float = 0.5
+    mode: str = "multi_task"
+    single_task_head: str = "exp"
+    exp_max: int = 6
+
+
+@dataclass
+class MTLConfig:
+    grad_strategy: str = "pcgrad"
+
+
+@dataclass
+class MorphScoreConfig:
+    weights: Dict[str, float] = field(default_factory=lambda: {"exp": 1.0, "icm": 1.0, "te": 1.0})
+    missing_strategy: str = "neutral"
+    neutral_icm_score: float = 2.0
+    neutral_te_score: float = 2.0
+    confidence_lambda: float = 0.0
 
 
 @dataclass
@@ -80,6 +101,7 @@ class TrainingConfig:
     morph_labeled_oversample_ratio: float = 0.5
     loss: LossConfig = field(default_factory=LossConfig)
     morph: MorphTrainingConfig = field(default_factory=MorphTrainingConfig)
+    mtl: MTLConfig = field(default_factory=MTLConfig)
     q: "QTrainingConfig" = field(default_factory=lambda: QTrainingConfig())
     joint_sampling: str = "balanced"
     quality_sampling: str = "proportional"
@@ -153,4 +175,5 @@ class ExperimentConfig:
     outputs: OutputConfig = field(default_factory=OutputConfig)
     quality_exp: QualityExpConfig = field(default_factory=QualityExpConfig)
     baseline: BaselineBinaryConfig = field(default_factory=BaselineBinaryConfig)
+    morph_score: MorphScoreConfig = field(default_factory=MorphScoreConfig)
     base_config: Optional[str] = None

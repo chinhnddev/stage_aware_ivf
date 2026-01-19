@@ -76,14 +76,14 @@ def _is_missing_token(value) -> bool:
     return text.upper() in MISSING_GARDNER_TOKENS
 
 
-def normalize_gardner_exp(value) -> Optional[int]:
+def normalize_gardner_exp(value, exp_max: int = 6) -> Optional[int]:
     if _is_missing_token(value):
         return None
     try:
         exp = int(float(str(value).strip()))
     except (ValueError, TypeError):
         return None
-    if exp < 1 or exp > 6:
+    if exp < 1 or exp > exp_max:
         return None
     return exp
 
@@ -101,7 +101,7 @@ def normalize_gardner_grade(value) -> Optional[str]:
     return ICM_TE_NUMERIC_MAP.get(num)
 
 
-def parse_gardner_components(gardner: Optional[str]) -> Optional[Tuple[int, Optional[str], Optional[str]]]:
+def parse_gardner_components(gardner: Optional[str], exp_max: int = 6) -> Optional[Tuple[int, Optional[str], Optional[str]]]:
     if gardner is None:
         return None
     if is_gardner_range_label(gardner):
@@ -109,7 +109,7 @@ def parse_gardner_components(gardner: Optional[str]) -> Optional[Tuple[int, Opti
     match = _GARDNER_COMPONENT_PATTERN.match(str(gardner))
     if not match:
         return None
-    exp = normalize_gardner_exp(match.group("exp"))
+    exp = normalize_gardner_exp(match.group("exp"), exp_max=exp_max)
     if exp is None:
         return None
     icm = normalize_gardner_grade(match.group("icm")) if match.group("icm") else None
@@ -171,6 +171,7 @@ def gardner_to_morphology_targets(
     exp_value=UNSET,
     icm_value=UNSET,
     te_value=UNSET,
+    exp_max: int = 6,
 ) -> Dict[str, int]:
     """
     Convert Gardner grade into morphology class IDs for expansion, ICM, and TE.
@@ -181,11 +182,11 @@ def gardner_to_morphology_targets(
     if is_gardner_range_label(gardner):
         raise ValueError(f"Cannot parse Gardner range label: {gardner!r}")
 
-    exp = normalize_gardner_exp(exp_value) if exp_value is not UNSET else None
+    exp = normalize_gardner_exp(exp_value, exp_max=exp_max) if exp_value is not UNSET else None
     icm = normalize_gardner_grade(icm_value) if icm_value is not UNSET else None
     te = normalize_gardner_grade(te_value) if te_value is not UNSET else None
 
-    components = parse_gardner_components(gardner)
+    components = parse_gardner_components(gardner, exp_max=exp_max)
     if exp is None and exp_value is UNSET and components is not None:
         exp = components[0]
     if icm is None and icm_value is UNSET and components is not None:
@@ -195,6 +196,8 @@ def gardner_to_morphology_targets(
 
     if exp is None:
         raise ValueError(f"Cannot parse Gardner expansion: {gardner!r}")
+    if exp < 1 or exp > exp_max:
+        raise ValueError(f"Gardner expansion {exp} out of range for exp_max={exp_max}.")
 
     if exp < 3:
         icm = None
@@ -204,8 +207,11 @@ def gardner_to_morphology_targets(
     icm_mask = 1 if icm is not None and exp >= 3 else 0
     te_mask = 1 if te is not None and exp >= 3 else 0
 
+    exp_classes = list(range(1, exp_max + 1))
+    exp_to_id = {value: idx for idx, value in enumerate(exp_classes)}
+
     return {
-        "exp": EXPANSION_TO_ID[exp],
+        "exp": exp_to_id[exp],
         "icm": ICM_TO_ID[icm] if icm_mask else -1,
         "te": TE_TO_ID[te] if te_mask else -1,
         "exp_mask": exp_mask,

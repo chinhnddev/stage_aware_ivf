@@ -38,8 +38,7 @@ from ivf.data.label_schema import (
     parse_gardner_components,
 )
 from ivf.data.splits import save_splits, split_by_group
-from ivf.models.encoder import ConvNeXtMini
-from ivf.models.multitask import MultiTaskEmbryoNet
+from ivf.models.factory import build_model_from_config
 from ivf.eval import compute_metrics, predict
 from ivf.train.callbacks import BestMetricCheckpoint, StepProgressLogger
 from ivf.train.lightning_module import MultiTaskLightningModule
@@ -1018,21 +1017,8 @@ def _run_quality_test_eval(
     logger.info("Saved EXP-4 test predictions to %s", preds_path)
 
 
-def build_model(cfg) -> MultiTaskEmbryoNet:
-    model_cfg = cfg.model
-    encoder_cfg = model_cfg.encoder
-    encoder = ConvNeXtMini(
-        in_channels=encoder_cfg.in_channels,
-        dims=encoder_cfg.dims,
-        feature_dim=encoder_cfg.feature_dim,
-        weights_path=encoder_cfg.weights_path,
-    )
-    return MultiTaskEmbryoNet(
-        encoder=encoder,
-        feature_dim=encoder_cfg.feature_dim,
-        quality_mode=model_cfg.heads.quality_mode,
-        quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
-    )
+def build_model(cfg, phase: Optional[str] = None):
+    return build_model_from_config(cfg, phase=phase)
 
 
 def get_prev_checkpoint(phase: str, checkpoints_dir: Path, cfg):
@@ -1082,7 +1068,7 @@ def main():
             logger.info("Phase morph: forcing quality_conditioning %s -> none.", prev_conditioning)
         cfg.model.heads.quality_conditioning = "none"
 
-    model = build_model(cfg)
+    model = build_model(cfg, phase=phase)
     logger.info("Quality conditioning mode: %s", model.quality_conditioning)
     phase_cfg = cfg.training
     loss_weights = resolve_config_dict(phase_cfg.loss_weights)
@@ -1098,6 +1084,11 @@ def main():
     morph_class_weight_mode = str(getattr(morph_cfg, "class_weight_mode", "inverse_freq")) if morph_cfg is not None else "inverse_freq"
     morph_balance_icm_te = bool(getattr(morph_cfg, "balance_icm_te", False)) if morph_cfg is not None else False
     morph_labeled_mix_ratio = float(getattr(morph_cfg, "labeled_mix_ratio", 0.5)) if morph_cfg is not None else 0.5
+    morph_mode = str(getattr(morph_cfg, "mode", "multi_task")) if morph_cfg is not None else "multi_task"
+    morph_single_head = str(getattr(morph_cfg, "single_task_head", "exp")) if morph_cfg is not None else "exp"
+    morph_exp_max = int(getattr(morph_cfg, "exp_max", 6)) if morph_cfg is not None else 6
+    mtl_cfg = getattr(phase_cfg, "mtl", None)
+    mtl_grad_strategy = str(getattr(mtl_cfg, "grad_strategy", "none")) if mtl_cfg is not None else "none"
     q_cfg = getattr(phase_cfg, "q", None)
     q_loss = str(getattr(q_cfg, "q_loss", "smoothl1")) if q_cfg is not None else "smoothl1"
     q_weights = resolve_config_dict(getattr(q_cfg, "q_weights", None)) if q_cfg is not None else None
@@ -1187,6 +1178,10 @@ def main():
         loss_weights=loss_weights,
         freeze_config=freeze_cfg,
         morph_loss_reduction=phase_cfg.morph_loss_reduction,
+        morph_mode=morph_mode,
+        single_task_head=morph_single_head,
+        mtl_grad_strategy=mtl_grad_strategy,
+        exp_num_classes=morph_exp_max,
         quality_pos_weight=quality_pos_weight,
         use_class_weights=morph_use_class_weights,
         class_weight_mode=morph_class_weight_mode,
@@ -1215,6 +1210,10 @@ def main():
                 loss_weights=loss_weights,
                 freeze_config=freeze_cfg,
                 morph_loss_reduction=phase_cfg.morph_loss_reduction,
+                morph_mode=morph_mode,
+                single_task_head=morph_single_head,
+                mtl_grad_strategy=mtl_grad_strategy,
+                exp_num_classes=morph_exp_max,
                 quality_pos_weight=quality_pos_weight,
                 use_class_weights=morph_use_class_weights,
                 class_weight_mode=morph_class_weight_mode,
@@ -1250,11 +1249,15 @@ def main():
         normalize=transforms_cfg.normalize,
         mean=list(transforms_cfg.mean) if transforms_cfg.mean is not None else None,
         std=list(transforms_cfg.std) if transforms_cfg.std is not None else None,
+        crop_size=getattr(transforms_cfg, "crop_size", None),
+        rotation_degrees=float(getattr(transforms_cfg, "rotation_degrees", 15.0)),
+        enable_vertical_flip=bool(getattr(transforms_cfg, "enable_vertical_flip", False)),
         joint_sampling=phase_cfg.joint_sampling,
         quality_sampling=phase_cfg.quality_sampling,
         morph_labeled_oversample_ratio=float(getattr(phase_cfg, "morph_labeled_oversample_ratio", 0.5)),
         morph_balance_icm_te=morph_balance_icm_te,
         morph_labeled_mix_ratio=morph_labeled_mix_ratio,
+        morph_exp_max=morph_exp_max,
         q_weights=q_weights,
     )
 
@@ -1395,6 +1398,10 @@ def main():
             loss_weights=loss_weights,
             freeze_config=freeze_cfg,
             morph_loss_reduction=phase_cfg.morph_loss_reduction,
+            morph_mode=morph_mode,
+            single_task_head=morph_single_head,
+            mtl_grad_strategy=mtl_grad_strategy,
+            exp_num_classes=morph_exp_max,
             quality_pos_weight=quality_pos_weight,
             use_class_weights=morph_use_class_weights,
             class_weight_mode=morph_class_weight_mode,
@@ -1424,6 +1431,10 @@ def main():
             loss_weights=loss_weights,
             freeze_config=freeze_cfg,
             morph_loss_reduction=phase_cfg.morph_loss_reduction,
+            morph_mode=morph_mode,
+            single_task_head=morph_single_head,
+            mtl_grad_strategy=mtl_grad_strategy,
+            exp_num_classes=morph_exp_max,
             quality_pos_weight=quality_pos_weight,
             use_class_weights=morph_use_class_weights,
             class_weight_mode=morph_class_weight_mode,

@@ -218,6 +218,7 @@ def _build_morphology_records(
     include_meta_day: bool,
     context: str,
     drop_missing_icm_te: bool = False,
+    exp_max: int = 6,
 ) -> list:
     records = []
     has_exp_col = "exp" in df.columns
@@ -236,7 +237,8 @@ def _build_morphology_records(
         "invalid_te": 0,
         "dropped_missing_icm_te": 0,
     }
-    exp_counts = {exp: 0 for exp in EXPANSION_CLASSES}
+    exp_classes = list(range(1, exp_max + 1))
+    exp_counts = {exp: 0 for exp in exp_classes}
     icm_counts = {"A": 0, "B": 0, "C": 0}
     te_counts = {"A": 0, "B": 0, "C": 0}
     for _, row in df.iterrows():
@@ -248,8 +250,8 @@ def _build_morphology_records(
         exp_raw = row.get("exp") if has_exp_col else None
         icm_raw = row.get("icm") if has_icm_col else None
         te_raw = row.get("te") if has_te_col else None
-        components = parse_gardner_components(grade)
-        exp = normalize_gardner_exp(exp_raw)
+        components = parse_gardner_components(grade, exp_max=exp_max)
+        exp = normalize_gardner_exp(exp_raw, exp_max=exp_max)
         if exp is None and components is not None:
             exp = components[0]
         if exp is None:
@@ -315,6 +317,7 @@ def _build_morphology_records(
                 exp_value=exp,
                 icm_value=icm_raw if has_icm_col else UNSET,
                 te_value=te_raw if has_te_col else UNSET,
+                exp_max=exp_max,
             )
         except ValueError:
             stats["invalid_exp"] += 1
@@ -563,11 +566,15 @@ class IVFDataModule(pl.LightningDataModule):
         normalize: bool = False,
         mean: Optional[list] = None,
         std: Optional[list] = None,
+        crop_size: Optional[int] = None,
+        rotation_degrees: float = 15.0,
+        enable_vertical_flip: bool = False,
         joint_sampling: str = "balanced",
         quality_sampling: str = "proportional",
         morph_labeled_oversample_ratio: float = 0.5,
         morph_balance_icm_te: bool = False,
         morph_labeled_mix_ratio: float = 0.5,
+        morph_exp_max: int = 6,
         q_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         super().__init__()
@@ -583,11 +590,15 @@ class IVFDataModule(pl.LightningDataModule):
         self.normalize = normalize
         self.mean = mean
         self.std = std
+        self.crop_size = crop_size
+        self.rotation_degrees = rotation_degrees
+        self.enable_vertical_flip = enable_vertical_flip
         self.joint_sampling = joint_sampling
         self.quality_sampling = quality_sampling
         self.morph_labeled_oversample_ratio = morph_labeled_oversample_ratio
         self.morph_balance_icm_te = morph_balance_icm_te
         self.morph_labeled_mix_ratio = morph_labeled_mix_ratio
+        self.morph_exp_max = morph_exp_max
         self.q_weights = q_weights
         self.morph_labeled_idx = []
         self.morph_icm_counts = None
@@ -696,6 +707,9 @@ class IVFDataModule(pl.LightningDataModule):
             normalize=self.normalize,
             mean=self.mean,
             std=self.std,
+            crop_size=self.crop_size,
+            rotation_degrees=self.rotation_degrees,
+            enable_vertical_flip=self.enable_vertical_flip,
         )
         eval_tf = get_eval_transforms(
             image_size=self.image_size,
@@ -722,6 +736,7 @@ class IVFDataModule(pl.LightningDataModule):
                 self.include_meta_day,
                 context="morph_train",
                 drop_missing_icm_te=False,
+                exp_max=self.morph_exp_max,
             )
             labeled_idx = []
             icm_counts = torch.zeros(len(ICM_CLASSES), dtype=torch.long)
@@ -767,6 +782,7 @@ class IVFDataModule(pl.LightningDataModule):
                     val_df,
                     self.include_meta_day,
                     context="morph_val",
+                    exp_max=self.morph_exp_max,
                 ),
                 transform=eval_tf,
                 include_meta_day=self.include_meta_day,
@@ -816,6 +832,7 @@ class IVFDataModule(pl.LightningDataModule):
                 blast_train,
                 self.include_meta_day,
                 context="joint_blast_train",
+                exp_max=self.morph_exp_max,
             )
             _log_morphology_train_stats(joint_blast_records, context="joint_blast_train")
             train_sets = [
@@ -834,7 +851,12 @@ class IVFDataModule(pl.LightningDataModule):
             ]
             val_sets = [
                 BaseImageDataset(
-                    _build_morphology_records(blast_val, self.include_meta_day, context="joint_blast_val"),
+                    _build_morphology_records(
+                        blast_val,
+                        self.include_meta_day,
+                        context="joint_blast_val",
+                        exp_max=self.morph_exp_max,
+                    ),
                     transform=eval_tf,
                     include_meta_day=self.include_meta_day,
                     root_dir=self._root_dir("blastocyst"),

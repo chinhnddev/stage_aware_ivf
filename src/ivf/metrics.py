@@ -14,9 +14,10 @@ from torchmetrics.classification import (
 from ivf.data.label_schema import EXPANSION_CLASSES, ICM_CLASSES, STAGE_CLASSES, TE_CLASSES
 
 
-def build_morphology_metrics():
+def build_morphology_metrics(exp_num_classes: int = None):
+    exp_num_classes = len(EXPANSION_CLASSES) if exp_num_classes is None else exp_num_classes
     return {
-        "exp_acc": MulticlassAccuracy(num_classes=len(EXPANSION_CLASSES)),
+        "exp_acc": MulticlassAccuracy(num_classes=exp_num_classes),
         "icm_acc": MulticlassAccuracy(num_classes=len(ICM_CLASSES)),
         "icm_bal_acc": MulticlassAccuracy(num_classes=len(ICM_CLASSES), average="macro"),
         "icm_macro_f1": MulticlassF1Score(num_classes=len(ICM_CLASSES), average="macro"),

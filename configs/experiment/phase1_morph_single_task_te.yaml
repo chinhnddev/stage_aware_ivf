@@ -1,0 +1,28 @@
+base_config: configs/experiment/base.yaml
+
+model:
+  name: joint_morph
+
+transforms:
+  image_size: 224
+  crop_size: 224
+  rotation_degrees: 15
+  enable_vertical_flip: false
+
+training:
+  morph:
+    mode: single_task
+    single_task_head: te
+    exp_max: 5
+  mtl:
+    grad_strategy: none
+
+morph_score:
+  weights:
+    exp: 1.0
+    icm: 1.0
+    te: 1.0
+  missing_strategy: neutral
+  neutral_icm_score: 2.0
+  neutral_te_score: 2.0
+  confidence_lambda: 0.0

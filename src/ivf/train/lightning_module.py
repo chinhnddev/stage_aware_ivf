@@ -31,6 +31,10 @@ class MultiTaskLightningModule(pl.LightningModule):
         loss_weights: Optional[Dict[str, float]] = None,
         freeze_config: Optional[Dict] = None,
         morph_loss_reduction: str = "mean",
+        morph_mode: str = "multi_task",
+        single_task_head: Optional[str] = None,
+        mtl_grad_strategy: str = "none",
+        exp_num_classes: Optional[int] = None,
         quality_pos_weight: Optional[float] = None,
         use_class_weights: bool = False,
         class_weight_mode: str = "inverse_freq",
@@ -52,6 +56,9 @@ class MultiTaskLightningModule(pl.LightningModule):
             get_logger("ivf").info("Morph phase: forcing stage/quality loss weights to 0.")
         self.freeze_config = freeze_config or {}
         self.morph_loss_reduction = morph_loss_reduction
+        self.morph_mode = morph_mode
+        self.single_task_head = single_task_head
+        self.mtl_grad_strategy = mtl_grad_strategy
         self.quality_pos_weight = quality_pos_weight
         self.use_class_weights = use_class_weights
         self.class_weight_mode = class_weight_mode
@@ -69,6 +76,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.exp_class_weight = None
         self.icm_class_weight = None
         self.te_class_weight = None
+        self.exp_num_classes = exp_num_classes or len(EXPANSION_CLASSES)
         self.icm_num_classes = len(ICM_CLASSES)
         self.te_num_classes = len(TE_CLASSES)
         self.exp_class_counts = None
@@ -80,6 +88,18 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         if self.morph_loss_reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
+        if self.morph_mode not in {"single_task", "multi_task"}:
+            raise ValueError(f"Unsupported morph_mode: {self.morph_mode}")
+        if self.morph_mode == "single_task":
+            if self.single_task_head not in {"exp", "icm", "te"}:
+                raise ValueError("single_task_head must be one of exp, icm, te when morph_mode=single_task.")
+        else:
+            self.single_task_head = None
+        if self.mtl_grad_strategy not in {"none", "pcgrad", "gradnorm"}:
+            raise ValueError(f"Unsupported mtl_grad_strategy: {self.mtl_grad_strategy}")
+        if self.mtl_grad_strategy == "gradnorm":
+            get_logger("ivf").warning("GradNorm not implemented; falling back to mtl_grad_strategy=none.")
+            self.mtl_grad_strategy = "none"
         if self.class_weight_mode not in {"inverse_freq"}:
             raise ValueError(f"Unsupported class_weight_mode: {self.class_weight_mode}")
         if self.q_loss not in {"smoothl1", "mse"}:
@@ -87,12 +107,18 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self._apply_phase_freeze(initial=True)
 
-        self.morph_metrics = nn.ModuleDict(build_morphology_metrics())
+        self.morph_metrics = nn.ModuleDict(build_morphology_metrics(exp_num_classes=self.exp_num_classes))
         self.stage_metrics = nn.ModuleDict(build_stage_metrics())
         self.quality_metrics = nn.ModuleDict(build_quality_metrics())
 
         self._epoch_start_time = None
         self._next_progress_pct = None
+
+        self.automatic_optimization = not (
+            self.phase == "morph"
+            and self.morph_mode == "multi_task"
+            and self.mtl_grad_strategy == "pcgrad"
+        )
 
         self.save_hyperparameters(ignore=["model"])
 
@@ -101,6 +127,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         def _set_trainable(module: nn.Module, trainable: bool) -> None:
             for p in module.parameters():
                 p.requires_grad = trainable
+
+        def _set_trainable_if_exists(name: str, trainable: bool) -> None:
+            module = getattr(self.model, name, None)
+            if module is not None:
+                _set_trainable(module, trainable)
 
         def _unfreeze_last_encoder_blocks(n_blocks: int) -> None:
             if n_blocks <= 0:
@@ -116,41 +147,41 @@ class MultiTaskLightningModule(pl.LightningModule):
                 _set_trainable(encoder.proj, True)
 
         if self.phase == "morph":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, True)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, False)
+            _set_trainable_if_exists("encoder", True)
+            _set_trainable_if_exists("morph", True)
+            _set_trainable_if_exists("stage", False)
+            _set_trainable_if_exists("quality", False)
             logger.info("EXP-1 Morphology: encoder+morph trainable; stage+quality frozen.")
         elif self.phase == "stage":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, True)
-            _set_trainable(self.model.quality, False)
+            _set_trainable_if_exists("encoder", True)
+            _set_trainable_if_exists("morph", False)
+            _set_trainable_if_exists("stage", True)
+            _set_trainable_if_exists("quality", False)
             if initial:
                 freeze_ratio = self.freeze_config.get("stage_start_ratio", 0.8)
                 freeze_encoder(self.model, ratio=freeze_ratio)
                 logger.info("EXP-2 Stage-aware: initial freeze ratio=%s", freeze_ratio)
         elif self.phase == "joint":
-            _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, True)
-            _set_trainable(self.model.stage, True)
-            _set_trainable(self.model.quality, False)
+            _set_trainable_if_exists("encoder", True)
+            _set_trainable_if_exists("morph", True)
+            _set_trainable_if_exists("stage", True)
+            _set_trainable_if_exists("quality", False)
             logger.info("EXP-3 Joint stabilization: encoder+morph+stage trainable; quality frozen.")
         elif self.phase == "quality":
             freeze_encoder(self.model, ratio=1.0)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, True)
+            _set_trainable_if_exists("morph", False)
+            _set_trainable_if_exists("stage", False)
+            _set_trainable_if_exists("quality", True)
             logger.info("EXP-4 Quality: encoder+morph+stage frozen; quality trainable.")
         elif self.phase == "q":
             if self.q_freeze_backbone:
                 freeze_encoder(self.model, ratio=1.0)
             else:
-                _set_trainable(self.model.encoder, True)
-            _set_trainable(self.model.morph, False)
-            _set_trainable(self.model.stage, False)
-            _set_trainable(self.model.quality, False)
-            _set_trainable(self.model.q_head, True)
+                _set_trainable_if_exists("encoder", True)
+            _set_trainable_if_exists("morph", False)
+            _set_trainable_if_exists("stage", False)
+            _set_trainable_if_exists("quality", False)
+            _set_trainable_if_exists("q_head", True)
             unfreeze_blocks = int(self.freeze_config.get("q_unfreeze_last_n_blocks", 0))
             if self.q_freeze_backbone and unfreeze_blocks > 0:
                 _unfreeze_last_encoder_blocks(unfreeze_blocks)
@@ -316,20 +347,28 @@ class MultiTaskLightningModule(pl.LightningModule):
             loss = F.smooth_l1_loss(preds, targets)
         return loss * weight
 
-    def _compute_losses(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
-        losses = {}
+    def _is_head_active(self, head: str) -> bool:
+        if self.morph_mode != "single_task":
+            return True
+        return self.single_task_head == head
 
-        if self.phase in {"morph", "joint"}:
-            loss_exp = self._masked_ce(
+    def _compute_morph_task_losses(self, outputs: Dict, targets: Dict) -> Dict[str, Optional[torch.Tensor]]:
+        losses = {"exp": None, "icm": None, "te": None}
+        if not self._is_head_active("exp"):
+            pass
+        else:
+            losses["exp"] = self._masked_ce(
                 outputs["morph"]["exp"],
                 targets["exp"],
                 targets.get("exp_mask"),
                 self.loss_weights.get("morph", 1.0),
                 class_weight=self.exp_class_weight,
-                num_classes=len(EXPANSION_CLASSES),
+                num_classes=self.exp_num_classes,
             )
+
+        if self._is_head_active("icm"):
             if self.use_focal_icm:
-                loss_icm = self._masked_focal_loss(
+                losses["icm"] = self._masked_focal_loss(
                     outputs["morph"]["icm"],
                     targets["icm"],
                     targets.get("icm_mask"),
@@ -339,7 +378,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     num_classes=self.icm_num_classes,
                 )
             else:
-                loss_icm = self._masked_ce(
+                losses["icm"] = self._masked_ce(
                     outputs["morph"]["icm"],
                     targets["icm"],
                     targets.get("icm_mask"),
@@ -347,8 +386,10 @@ class MultiTaskLightningModule(pl.LightningModule):
                     class_weight=self.icm_class_weight,
                     num_classes=self.icm_num_classes,
                 )
+
+        if self._is_head_active("te"):
             if self.use_focal_te:
-                loss_te = self._masked_focal_loss(
+                losses["te"] = self._masked_focal_loss(
                     outputs["morph"]["te"],
                     targets["te"],
                     targets.get("te_mask"),
@@ -358,7 +399,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     num_classes=self.te_num_classes,
                 )
             else:
-                loss_te = self._masked_ce(
+                losses["te"] = self._masked_ce(
                     outputs["morph"]["te"],
                     targets["te"],
                     targets.get("te_mask"),
@@ -366,11 +407,72 @@ class MultiTaskLightningModule(pl.LightningModule):
                     class_weight=self.te_class_weight,
                     num_classes=self.te_num_classes,
                 )
-            morph_losses = [l for l in [loss_exp, loss_icm, loss_te] if l is not None]
-            if morph_losses:
-                total = sum(morph_losses)
-                if self.morph_loss_reduction == "mean":
-                    total = total / len(morph_losses)
+
+        return losses
+
+    def _reduce_morph_losses(self, task_losses: Dict[str, Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+        morph_losses = [loss for loss in task_losses.values() if loss is not None]
+        if not morph_losses:
+            return None
+        total = sum(morph_losses)
+        if self.morph_loss_reduction == "mean":
+            total = total / len(morph_losses)
+        return total
+
+    def _use_pcgrad(self) -> bool:
+        return (
+            self.phase == "morph"
+            and self.morph_mode == "multi_task"
+            and self.mtl_grad_strategy == "pcgrad"
+        )
+
+    def _pcgrad_update(self, task_losses, optimizer) -> None:
+        params = [p for p in self.parameters() if p.requires_grad]
+        grads = []
+        for loss in task_losses:
+            grad = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            grads.append([g.detach().clone() if g is not None else None for g in grad])
+
+        for i in range(len(grads)):
+            for j in range(len(grads)):
+                if i == j:
+                    continue
+                dot = None
+                norm = None
+                for g_i, g_j in zip(grads[i], grads[j]):
+                    if g_i is None or g_j is None:
+                        continue
+                    dot_val = (g_i * g_j).sum()
+                    norm_val = (g_j * g_j).sum()
+                    dot = dot_val if dot is None else dot + dot_val
+                    norm = norm_val if norm is None else norm + norm_val
+                if dot is None or norm is None:
+                    continue
+                if dot < 0 and norm > 0:
+                    coeff = dot / norm
+                    for idx, (g_i, g_j) in enumerate(zip(grads[i], grads[j])):
+                        if g_i is None or g_j is None:
+                            continue
+                        grads[i][idx] = g_i - coeff * g_j
+
+        for p_idx, p in enumerate(params):
+            grad_sum = None
+            for g in grads:
+                g_i = g[p_idx]
+                if g_i is None:
+                    continue
+                grad_sum = g_i if grad_sum is None else grad_sum + g_i
+            if grad_sum is not None:
+                p.grad = grad_sum
+        optimizer.step()
+
+    def _compute_losses(self, outputs: Dict, targets: Dict) -> Dict[str, torch.Tensor]:
+        losses = {}
+
+        if self.phase in {"morph", "joint"}:
+            task_losses = self._compute_morph_task_losses(outputs, targets)
+            total = self._reduce_morph_losses(task_losses)
+            if total is not None:
                 losses["morphology"] = total
 
         if self.phase in {"stage", "joint"}:
@@ -421,7 +523,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     targets.get("exp_mask"),
                     self.q_aux_alpha,
                     class_weight=self.exp_class_weight,
-                    num_classes=len(EXPANSION_CLASSES),
+                    num_classes=self.exp_num_classes,
                 )
                 if loss_exp is not None:
                     aux_losses.append(loss_exp)
@@ -463,7 +565,23 @@ class MultiTaskLightningModule(pl.LightningModule):
     def training_step(self, batch: Dict, batch_idx: int):
         self._guardrails(batch)
         outputs = self.model(batch["image"])
-        losses = self._compute_losses(outputs, batch["targets"])
+        if self._use_pcgrad():
+            optimizer = self.optimizers()
+            optimizer.zero_grad()
+            task_losses = self._compute_morph_task_losses(outputs, batch["targets"])
+            total = self._reduce_morph_losses(task_losses)
+            if total is None:
+                total = torch.tensor(0.0, device=outputs["features"].device)
+            active_losses = [loss for loss in task_losses.values() if loss is not None]
+            if active_losses:
+                if len(active_losses) == 1:
+                    self.manual_backward(active_losses[0])
+                    optimizer.step()
+                else:
+                    self._pcgrad_update(active_losses, optimizer)
+            losses = {"total": total, "morphology": total}
+        else:
+            losses = self._compute_losses(outputs, batch["targets"])
         batch_size = batch["image"].shape[0] if hasattr(batch.get("image"), "shape") else None
         self.log("train/loss", losses["total"], on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
         if "morphology" in losses:
@@ -498,20 +616,22 @@ class MultiTaskLightningModule(pl.LightningModule):
         targets = batch["targets"]
 
         if self.phase in {"morph", "joint"}:
-            if "exp_acc" in self.morph_metrics:
+            if self._is_head_active("exp") and "exp_acc" in self.morph_metrics:
                 t = targets["exp"]
                 mask = targets.get("exp_mask")
                 mask = mask > 0 if mask is not None else t >= 0
-                mask = mask & (t < len(EXPANSION_CLASSES))
+                mask = mask & (t < self.exp_num_classes)
                 exp_n = int(mask.sum().item())
                 if self._val_counts is not None:
                     self._val_counts["exp"] += exp_n
                 if exp_n > 0:
-                    preds = outputs["morph"]["exp"].argmax(dim=-1)
+                    preds = outputs["morph"]["exp"][:, : self.exp_num_classes].argmax(dim=-1)
                     self.morph_metrics["exp_acc"].update(preds[mask], t[mask])
                     self.log("val/exp_acc", self.morph_metrics["exp_acc"], on_epoch=True, prog_bar=False, batch_size=batch_size)
 
             for head, num_classes in (("icm", self.icm_num_classes), ("te", self.te_num_classes)):
+                if not self._is_head_active(head):
+                    continue
                 t = targets[head]
                 mask = targets.get(f"{head}_mask")
                 mask = mask > 0 if mask is not None else t >= 0
@@ -536,6 +656,8 @@ class MultiTaskLightningModule(pl.LightningModule):
 
             if self._val_pred_counts is not None:
                 for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
+                    if not self._is_head_active(head):
+                        continue
                     t = targets[head]
                     mask = targets.get(f"{head}_mask")
                     num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes
@@ -620,9 +742,12 @@ class MultiTaskLightningModule(pl.LightningModule):
         _append(parts, "val_loss", "val/loss")
 
         if self.phase in {"morph", "joint"}:
-            _append(parts, "val_exp_acc", "val/exp_acc")
-            _append(parts, "val_icm_acc", "val/icm_acc")
-            _append(parts, "val_te_acc", "val/te_acc")
+            if self._is_head_active("exp"):
+                _append(parts, "val_exp_acc", "val/exp_acc")
+            if self._is_head_active("icm"):
+                _append(parts, "val_icm_acc", "val/icm_acc")
+            if self._is_head_active("te"):
+                _append(parts, "val_te_acc", "val/te_acc")
         if self.phase in {"stage", "joint"}:
             _append(parts, "val_stage_acc", "val/stage_acc")
             _append(parts, "val_stage_f1", "val/stage_f1")
@@ -639,9 +764,12 @@ class MultiTaskLightningModule(pl.LightningModule):
             get_logger("ivf").info(" ".join(parts))
 
         if self._val_counts and self.phase in {"morph", "joint"}:
-            self.log("val_exp_n", self._val_counts.get("exp", 0), on_epoch=True, prog_bar=False)
-            self.log("val_icm_n", self._val_counts.get("icm", 0), on_epoch=True, prog_bar=False)
-            self.log("val_te_n", self._val_counts.get("te", 0), on_epoch=True, prog_bar=False)
+            if self._is_head_active("exp"):
+                self.log("val_exp_n", self._val_counts.get("exp", 0), on_epoch=True, prog_bar=False)
+            if self._is_head_active("icm"):
+                self.log("val_icm_n", self._val_counts.get("icm", 0), on_epoch=True, prog_bar=False)
+            if self._is_head_active("te"):
+                self.log("val_te_n", self._val_counts.get("te", 0), on_epoch=True, prog_bar=False)
             get_logger("ivf").info(
                 "Validation labeled counts: exp=%s icm=%s te=%s",
                 self._val_counts.get("exp", 0),
@@ -649,18 +777,20 @@ class MultiTaskLightningModule(pl.LightningModule):
                 self._val_counts.get("te", 0),
             )
             device = getattr(self, "device", None) or torch.device("cpu")
-            if self._val_counts.get("exp", 0) == 0:
+            if self._is_head_active("exp") and self._val_counts.get("exp", 0) == 0:
                 self.log("val/exp_acc", torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False)
-            if self._val_counts.get("icm", 0) == 0:
+            if self._is_head_active("icm") and self._val_counts.get("icm", 0) == 0:
                 for key in ("val/icm_acc", "val/icm_bal_acc", "val/icm_macro_f1"):
                     self.log(key, torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False)
-            if self._val_counts.get("te", 0) == 0:
+            if self._is_head_active("te") and self._val_counts.get("te", 0) == 0:
                 for key in ("val/te_acc", "val/te_bal_acc", "val/te_macro_f1"):
                     self.log(key, torch.tensor(float("nan"), device=device), on_epoch=True, prog_bar=False)
 
         if self._val_pred_counts and self.phase in {"morph", "joint"}:
             logger = get_logger("ivf")
             for head, classes in (("icm", ICM_CLASSES[: self.icm_num_classes]), ("te", TE_CLASSES[: self.te_num_classes])):
+                if not self._is_head_active(head):
+                    continue
                 counts = self._val_pred_counts.get(head)
                 true_counts = self._val_true_counts.get(head) if self._val_true_counts else None
                 if counts is None:
@@ -714,6 +844,8 @@ class MultiTaskLightningModule(pl.LightningModule):
 
             if self._val_manual_correct and self._val_manual_total:
                 for head in ("icm", "te"):
+                    if not self._is_head_active(head):
+                        continue
                     if f"{head}_acc" in self.morph_metrics:
                         continue
                     total = self._val_manual_total.get(head, 0)
@@ -733,7 +865,7 @@ class MultiTaskLightningModule(pl.LightningModule):
             return
 
         counts = {
-            "exp": torch.zeros(len(EXPANSION_CLASSES), dtype=torch.long),
+            "exp": torch.zeros(self.exp_num_classes, dtype=torch.long),
             "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
             "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
         }
@@ -763,7 +895,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         logger = get_logger("ivf")
         logger.info(
             "Morph train exp counts: %s",
-            {exp: int(counts["exp"][i]) for i, exp in enumerate(EXPANSION_CLASSES)},
+            {exp: int(counts["exp"][i]) for i, exp in enumerate(range(1, self.exp_num_classes + 1))},
         )
         logger.info("Morph train icm counts: %s", {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)})
         logger.info("Morph train te counts: %s", {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)})
@@ -809,7 +941,7 @@ class MultiTaskLightningModule(pl.LightningModule):
             return weights
 
         if self.use_class_weights:
-            self.exp_class_weight = _compute_weights("exp", len(EXPANSION_CLASSES))
+            self.exp_class_weight = _compute_weights("exp", self.exp_num_classes)
             self.icm_class_weight = _compute_weights("icm", self.icm_num_classes)
             self.te_class_weight = _compute_weights("te", self.te_num_classes)
             if self.exp_class_weight is not None:

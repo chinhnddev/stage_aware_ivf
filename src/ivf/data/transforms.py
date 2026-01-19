@@ -2,21 +2,12 @@
 Transform helpers with biologically plausible augmentations.
 """
 
-import random
 from typing import Iterable, Literal, Optional
 
 try:  # pragma: no cover - optional dependency
     from torchvision import transforms as T
 except ImportError as exc:  # pragma: no cover
     raise ImportError("torchvision is required for transforms. Install torchvision to use data transforms.") from exc
-
-
-class RandomRotate90:
-    def __init__(self, angles=None):
-        self.angles = angles or [0, 90, 180, 270]
-
-    def __call__(self, img):
-        return img.rotate(random.choice(self.angles))
 
 
 def _base_transforms(
@@ -44,25 +35,30 @@ def get_train_transforms(
     normalize: bool = False,
     mean: Optional[Iterable[float]] = None,
     std: Optional[Iterable[float]] = None,
+    crop_size: Optional[int] = None,
+    rotation_degrees: float = 15.0,
+    enable_vertical_flip: bool = False,
 ):
     if level not in {"light", "medium", "strong"}:
         raise ValueError(f"Unsupported transform level: {level}")
 
-    aug = [
-        T.RandomHorizontalFlip(),
-        T.RandomVerticalFlip(),
-        RandomRotate90(),
-    ]
-
+    crop_size = image_size if crop_size is None else crop_size
     if level == "light":
-        aug.append(T.ColorJitter(brightness=0.05, contrast=0.05))
+        crop_scale = (0.9, 1.0)
     elif level == "medium":
-        aug.append(T.ColorJitter(brightness=0.15, contrast=0.15))
+        crop_scale = (0.8, 1.0)
     else:
-        aug.append(T.ColorJitter(brightness=0.3, contrast=0.3))
+        crop_scale = (0.7, 1.0)
+
+    aug = [T.RandomResizedCrop(crop_size, scale=crop_scale)]
+    aug.append(T.RandomHorizontalFlip())
+    if enable_vertical_flip:
+        aug.append(T.RandomVerticalFlip())
+    if rotation_degrees and rotation_degrees > 0:
+        aug.append(T.RandomRotation(degrees=rotation_degrees))
 
     ops = _base_transforms(image_size, normalize, mean, std)
-    return T.Compose(ops[:1] + aug + ops[1:])
+    return T.Compose(aug + ops[1:])
 
 
 def get_eval_transforms(
@@ -85,8 +81,8 @@ def has_augmentation(transform) -> bool:
         (
             T.RandomHorizontalFlip,
             T.RandomVerticalFlip,
-            T.ColorJitter,
-            RandomRotate90,
+            T.RandomResizedCrop,
+            T.RandomRotation,
         ),
     ):
         return True
