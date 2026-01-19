@@ -6,6 +6,9 @@ model:
 transforms:
   image_size: 224
   crop_size: 224
+  train_crop_scale: [0.8, 1.0]
+  train_crop_ratio: [0.9, 1.1]
+  train_translate_max: 0.0
   rotation_degrees: 15
   enable_vertical_flip: false
 

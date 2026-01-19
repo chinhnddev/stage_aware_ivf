@@ -203,6 +203,7 @@ def main() -> None:
         normalize=cfg.transforms.normalize,
         mean=list(cfg.transforms.mean) if cfg.transforms.mean is not None else None,
         std=list(cfg.transforms.std) if cfg.transforms.std is not None else None,
+        crop_size=getattr(cfg.transforms, "crop_size", None),
     )
     assert_no_augmentation(eval_tf)
 

@@ -48,6 +48,9 @@ class TransformConfig:
     quality: str = "light"
     q: str = "light"
     crop_size: Optional[int] = None
+    train_crop_scale: List[float] = field(default_factory=lambda: [0.8, 1.0])
+    train_crop_ratio: List[float] = field(default_factory=lambda: [0.9, 1.1])
+    train_translate_max: float = 0.0
     rotation_degrees: float = 15.0
     enable_vertical_flip: bool = False
     normalize: bool = False

@@ -16,12 +16,18 @@ data:
   include_meta_day_default: true
 
 transforms:
-  image_size: 256
+  image_size: 224
   morph: light
   stage: light
   joint: light
   quality: light
   q: light
+  crop_size: 224
+  train_crop_scale: [0.8, 1.0]
+  train_crop_ratio: [0.9, 1.1]
+  train_translate_max: 0.0
+  rotation_degrees: 15.0
+  enable_vertical_flip: false
   normalize: true
   mean: [0.5, 0.5, 0.5]
   std: [0.5, 0.5, 0.5]

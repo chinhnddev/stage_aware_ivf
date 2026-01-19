@@ -2,31 +2,12 @@
 Transform helpers with biologically plausible augmentations.
 """
 
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, Tuple
 
 try:  # pragma: no cover - optional dependency
     from torchvision import transforms as T
 except ImportError as exc:  # pragma: no cover
     raise ImportError("torchvision is required for transforms. Install torchvision to use data transforms.") from exc
-
-
-def _base_transforms(
-    image_size: int,
-    normalize: bool,
-    mean: Optional[Iterable[float]],
-    std: Optional[Iterable[float]],
-):
-    ops = [
-        T.Resize((image_size, image_size)),
-    ]
-    if normalize:
-        mean_vals = list(mean) if mean is not None else [0.5, 0.5, 0.5]
-        std_vals = list(std) if std is not None else [0.5, 0.5, 0.5]
-        ops.append(T.ToTensor())
-        ops.append(T.Normalize(mean=mean_vals, std=std_vals))
-    else:
-        ops.append(T.ToTensor())
-    return ops
 
 
 def get_train_transforms(
@@ -36,29 +17,36 @@ def get_train_transforms(
     mean: Optional[Iterable[float]] = None,
     std: Optional[Iterable[float]] = None,
     crop_size: Optional[int] = None,
+    crop_scale: Optional[Tuple[float, float]] = None,
+    crop_ratio: Optional[Tuple[float, float]] = None,
     rotation_degrees: float = 15.0,
     enable_vertical_flip: bool = False,
+    translate_max: float = 0.0,
 ):
     if level not in {"light", "medium", "strong"}:
         raise ValueError(f"Unsupported transform level: {level}")
 
     crop_size = image_size if crop_size is None else crop_size
-    if level == "light":
-        crop_scale = (0.9, 1.0)
-    elif level == "medium":
+    if crop_scale is None:
         crop_scale = (0.8, 1.0)
-    else:
-        crop_scale = (0.7, 1.0)
+    if crop_ratio is None:
+        crop_ratio = (0.9, 1.1)
 
-    aug = [T.RandomResizedCrop(crop_size, scale=crop_scale)]
-    aug.append(T.RandomHorizontalFlip())
+    aug = [T.RandomResizedCrop(crop_size, scale=crop_scale, ratio=crop_ratio)]
+    aug.append(T.RandomHorizontalFlip(p=0.5))
     if enable_vertical_flip:
-        aug.append(T.RandomVerticalFlip())
+        aug.append(T.RandomVerticalFlip(p=0.5))
+    if translate_max and translate_max > 0:
+        aug.append(T.RandomAffine(degrees=0, translate=(translate_max, translate_max)))
     if rotation_degrees and rotation_degrees > 0:
         aug.append(T.RandomRotation(degrees=rotation_degrees))
 
-    ops = _base_transforms(image_size, normalize, mean, std)
-    return T.Compose(aug + ops[1:])
+    ops = [T.ToTensor()]
+    if normalize:
+        mean_vals = list(mean) if mean is not None else [0.5, 0.5, 0.5]
+        std_vals = list(std) if std is not None else [0.5, 0.5, 0.5]
+        ops.append(T.Normalize(mean=mean_vals, std=std_vals))
+    return T.Compose(aug + ops)
 
 
 def get_eval_transforms(
@@ -66,8 +54,19 @@ def get_eval_transforms(
     normalize: bool = False,
     mean: Optional[Iterable[float]] = None,
     std: Optional[Iterable[float]] = None,
+    crop_size: Optional[int] = None,
 ):
-    return T.Compose(_base_transforms(image_size, normalize, mean, std))
+    crop_size = image_size if crop_size is None else crop_size
+    ops = [
+        T.Resize(image_size),
+        T.CenterCrop(crop_size),
+        T.ToTensor(),
+    ]
+    if normalize:
+        mean_vals = list(mean) if mean is not None else [0.5, 0.5, 0.5]
+        std_vals = list(std) if std is not None else [0.5, 0.5, 0.5]
+        ops.append(T.Normalize(mean=mean_vals, std=std_vals))
+    return T.Compose(ops)
 
 
 def has_augmentation(transform) -> bool:
@@ -83,6 +82,7 @@ def has_augmentation(transform) -> bool:
             T.RandomVerticalFlip,
             T.RandomResizedCrop,
             T.RandomRotation,
+            T.RandomAffine,
         ),
     ):
         return True

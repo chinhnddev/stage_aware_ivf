@@ -567,6 +567,9 @@ class IVFDataModule(pl.LightningDataModule):
         mean: Optional[list] = None,
         std: Optional[list] = None,
         crop_size: Optional[int] = None,
+        train_crop_scale: Optional[list] = None,
+        train_crop_ratio: Optional[list] = None,
+        train_translate_max: float = 0.0,
         rotation_degrees: float = 15.0,
         enable_vertical_flip: bool = False,
         joint_sampling: str = "balanced",
@@ -591,6 +594,9 @@ class IVFDataModule(pl.LightningDataModule):
         self.mean = mean
         self.std = std
         self.crop_size = crop_size
+        self.train_crop_scale = train_crop_scale
+        self.train_crop_ratio = train_crop_ratio
+        self.train_translate_max = train_translate_max
         self.rotation_degrees = rotation_degrees
         self.enable_vertical_flip = enable_vertical_flip
         self.joint_sampling = joint_sampling
@@ -708,17 +714,23 @@ class IVFDataModule(pl.LightningDataModule):
             mean=self.mean,
             std=self.std,
             crop_size=self.crop_size,
+            crop_scale=tuple(self.train_crop_scale) if self.train_crop_scale is not None else None,
+            crop_ratio=tuple(self.train_crop_ratio) if self.train_crop_ratio is not None else None,
             rotation_degrees=self.rotation_degrees,
             enable_vertical_flip=self.enable_vertical_flip,
+            translate_max=self.train_translate_max,
         )
         eval_tf = get_eval_transforms(
             image_size=self.image_size,
             normalize=self.normalize,
             mean=self.mean,
             std=self.std,
+            crop_size=self.crop_size,
         )
         assert_no_augmentation(eval_tf)
         logger = get_logger("ivf")
+        logger.info("Train transforms: %s", train_tf)
+        logger.info("Eval transforms: %s", eval_tf)
         if "hungvuong" in self.splits and self.phase in {"morph", "stage", "joint", "quality", "q"}:
             logger.warning("Hung Vuong splits present during phase=%s; ignored for training.", self.phase)
 
