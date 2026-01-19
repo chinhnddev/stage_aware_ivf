@@ -109,6 +109,22 @@ def _resolve_columns(df: pd.DataFrame, args, data_cfg: Optional[dict]):
     return image_col, id_col, grade_col, exp_col, icm_col, te_col, day_col
 
 
+def _load_testset_filenames(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, header=None)
+    if df.shape[1] >= 4:
+        first_row = [str(value).strip().lower() for value in df.iloc[0].tolist()]
+        if any("exp" in value or "icm" in value or "te" in value for value in first_row):
+            df = pd.read_csv(path)
+    if df.shape[1] < 4:
+        raise ValueError(f"testset_filenames must have 4 columns: filename, exp, icm, te (got {df.shape[1]}).")
+    df = df.iloc[:, :4].copy()
+    df.columns = ["filename", "EXP_silver", "ICM_silver", "TE_silver"]
+    df["filename"] = df["filename"].astype(str).str.strip()
+    for col in ("EXP_silver", "ICM_silver", "TE_silver"):
+        df[col] = df[col].apply(_coerce_int)
+    return df
+
+
 def _build_records(
     df: pd.DataFrame,
     exp_max: int,
@@ -156,6 +172,9 @@ def _build_records(
             icm = components[1]
         if te is None and components is not None:
             te = components[2]
+        if exp is not None and exp < 3:
+            icm = None
+            te = None
 
         exp_id = exp - 1 if exp is not None else None
         exp_mask = 1 if exp_id is not None else 0
@@ -219,6 +238,7 @@ def parse_args():
     parser.add_argument("--config", required=True, help="Experiment config path.")
     parser.add_argument("--checkpoint", required=True, help="Morphology checkpoint path.")
     parser.add_argument("--data_csv", required=True, help="CSV file containing morphology data.")
+    parser.add_argument("--testset_filenames", default=None, help="Optional testset_filenames.csv (paper split).")
     parser.add_argument("--output_dir", default=None, help="Output directory under outputs/.")
     parser.add_argument("--root_dir", default=None, help="Optional root dir for relative image paths.")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -247,6 +267,21 @@ def main() -> None:
 
     df = pd.read_csv(args.data_csv)
     image_col, id_col, grade_col, exp_col, icm_col, te_col, day_col = _resolve_columns(df, args, data_cfg)
+    if args.testset_filenames:
+        test_df = _load_testset_filenames(Path(args.testset_filenames))
+        df = df.copy()
+        df["__file"] = df[image_col].apply(lambda x: Path(str(x)).name)
+        test_df["__file"] = test_df["filename"].apply(lambda x: Path(str(x)).name)
+        missing = sorted(set(test_df["__file"]) - set(df["__file"]))
+        if missing:
+            print(f"Warning: {len(missing)} test filenames not found in metadata; first few: {missing[:3]}")
+        df = df.merge(test_df.drop(columns=["filename"]), on="__file", how="inner")
+        if df.empty:
+            raise ValueError("No matching rows found for testset_filenames.")
+        exp_col = "EXP_silver"
+        icm_col = "ICM_silver"
+        te_col = "TE_silver"
+        grade_col = None
     records = _build_records(
         df,
         exp_max=exp_max,

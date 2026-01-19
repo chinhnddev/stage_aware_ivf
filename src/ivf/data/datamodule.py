@@ -348,52 +348,53 @@ def _build_morphology_records(
         te_id = None
         icm_norm = None
         te_norm = None
-
-        if has_icm_col:
-            if icm_zero_based:
-                _assert_silver_range(icm_raw, {0, 1, 2, 3}, "icm", context)
-                icm_id = normalize_silver_grade(icm_raw)
-                if _is_missing_token(icm_raw) or _is_silver_undefined(icm_raw):
-                    stats["missing_icm"] += 1
-                elif icm_id is None:
-                    stats["invalid_icm"] += 1
-            else:
-                icm_norm = normalize_gardner_grade(icm_raw)
-                if _is_missing_token(icm_raw):
-                    stats["missing_icm"] += 1
-                elif icm_norm is None:
-                    stats["invalid_icm"] += 1
+        force_nd = exp_value < 3
+        if not force_nd:
+            if has_icm_col:
+                if icm_zero_based:
+                    _assert_silver_range(icm_raw, {0, 1, 2, 3}, "icm", context)
+                    icm_id = normalize_silver_grade(icm_raw)
+                    if _is_missing_token(icm_raw) or _is_silver_undefined(icm_raw):
+                        stats["missing_icm"] += 1
+                    elif icm_id is None:
+                        stats["invalid_icm"] += 1
                 else:
+                    icm_norm = normalize_gardner_grade(icm_raw)
+                    if _is_missing_token(icm_raw):
+                        stats["missing_icm"] += 1
+                    elif icm_norm is None:
+                        stats["invalid_icm"] += 1
+                    else:
+                        icm_id = ICM_TO_ID.get(icm_norm)
+            else:
+                icm_norm = components[1] if components else None
+                if icm_norm is None:
+                    stats["missing_icm"] += 1
+                elif icm_norm in ICM_CLASSES:
                     icm_id = ICM_TO_ID.get(icm_norm)
-        else:
-            icm_norm = components[1] if components else None
-            if icm_norm is None:
-                stats["missing_icm"] += 1
-            elif icm_norm in ICM_CLASSES:
-                icm_id = ICM_TO_ID.get(icm_norm)
 
-        if has_te_col:
-            if te_zero_based:
-                _assert_silver_range(te_raw, {0, 1, 2, 3}, "te", context)
-                te_id = normalize_silver_grade(te_raw)
-                if _is_missing_token(te_raw) or _is_silver_undefined(te_raw):
-                    stats["missing_te"] += 1
-                elif te_id is None:
-                    stats["invalid_te"] += 1
-            else:
-                te_norm = normalize_gardner_grade(te_raw)
-                if _is_missing_token(te_raw):
-                    stats["missing_te"] += 1
-                elif te_norm is None:
-                    stats["invalid_te"] += 1
+            if has_te_col:
+                if te_zero_based:
+                    _assert_silver_range(te_raw, {0, 1, 2, 3}, "te", context)
+                    te_id = normalize_silver_grade(te_raw)
+                    if _is_missing_token(te_raw) or _is_silver_undefined(te_raw):
+                        stats["missing_te"] += 1
+                    elif te_id is None:
+                        stats["invalid_te"] += 1
                 else:
+                    te_norm = normalize_gardner_grade(te_raw)
+                    if _is_missing_token(te_raw):
+                        stats["missing_te"] += 1
+                    elif te_norm is None:
+                        stats["invalid_te"] += 1
+                    else:
+                        te_id = TE_TO_ID.get(te_norm)
+            else:
+                te_norm = components[2] if components else None
+                if te_norm is None:
+                    stats["missing_te"] += 1
+                elif te_norm in TE_CLASSES:
                     te_id = TE_TO_ID.get(te_norm)
-        else:
-            te_norm = components[2] if components else None
-            if te_norm is None:
-                stats["missing_te"] += 1
-            elif te_norm in TE_CLASSES:
-                te_id = TE_TO_ID.get(te_norm)
 
         if drop_missing_icm_te and (icm_id is None or te_id is None):
             stats["dropped_missing_icm_te"] += 1

@@ -283,6 +283,10 @@ def _extract_morph_labels(row: pd.Series):
     if te is None and components is not None:
         te = components[2]
 
+    if exp is not None and exp < 3:
+        icm = None
+        te = None
+
     return exp, icm, te
 
 
