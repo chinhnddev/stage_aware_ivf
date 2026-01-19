@@ -39,6 +39,9 @@ class EMA:
                     continue
                 shadow = self.shadow[k]
                 value = v.detach()
+                if shadow.device != value.device:
+                    shadow = shadow.to(device=value.device)
+                    self.shadow[k] = shadow
                 if value.dtype != shadow.dtype:
                     value = value.to(dtype=shadow.dtype)
                 shadow.mul_(self.decay).add_(value, alpha=1.0 - self.decay)
