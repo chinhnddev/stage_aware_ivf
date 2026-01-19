@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from ivf.data.label_schema import EXPANSION_CLASSES, ICM_CLASSES, STAGE_CLASSES, TE_CLASSES
-from ivf.models.encoder import ConvNeXtMini
 from ivf.models.heads import (
     ConditionedQualityHead,
     MorphologyHeads,
@@ -16,6 +15,7 @@ from ivf.models.heads import (
     StageConditionedQualityHead,
     StageHead,
 )
+from ivf.models.morph_backbone import MorphologyBackbone
 
 
 class MultiTaskEmbryoNet(nn.Module):
@@ -27,7 +27,7 @@ class MultiTaskEmbryoNet(nn.Module):
         quality_conditioning: str = "morph+stage",
     ) -> None:
         super().__init__()
-        self.encoder = encoder if encoder is not None else ConvNeXtMini(feature_dim=feature_dim)
+        self.encoder = encoder if encoder is not None else MorphologyBackbone(feature_dim=feature_dim)
         self.morph = MorphologyHeads(feature_dim)
         self.stage = StageHead(feature_dim)
         self.q_head = nn.Sequential(

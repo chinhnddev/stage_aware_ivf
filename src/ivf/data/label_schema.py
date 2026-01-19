@@ -34,7 +34,7 @@ class GardnerComponents:
 
 
 # Expansion classes follow Gardner scale 1–6, IDs are zero-based to suit classifiers.
-EXPANSION_CLASSES = [1, 2, 3, 4, 5, 6]
+EXPANSION_CLASSES = [1, 2, 3, 4, 5]
 ICM_CLASSES = ["A", "B", "C"]
 TE_CLASSES = ["A", "B", "C"]
 
@@ -52,8 +52,8 @@ MISSING_GARDNER_TOKENS = {"", "0", "ND", "NA", "N/A"}
 ICM_TE_NUMERIC_MAP = {1: "A", 2: "B", 3: "C"}
 DEFAULT_Q_WEIGHTS = {"exp": 0.4, "icm": 0.3, "te": 0.3}
 
-_GARDNER_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])(?P<te>[ABCabc123])\s*$")
-_GARDNER_COMPONENT_PATTERN = re.compile(r"^\s*(?P<exp>[1-6])(?P<icm>[ABCabc123])?(?P<te>[ABCabc123])?\s*$")
+_GARDNER_PATTERN = re.compile(r"^\s*(?P<exp>[1-5])(?P<icm>[ABCabc123])(?P<te>[ABCabc123])\s*$")
+_GARDNER_COMPONENT_PATTERN = re.compile(r"^\s*(?P<exp>[1-5])(?P<icm>[ABCabc123])?(?P<te>[ABCabc123])?\s*$")
 _GARDNER_RANGE_PATTERN = re.compile(r"\d\s*-\s*\d")
 
 
@@ -76,7 +76,7 @@ def _is_missing_token(value) -> bool:
     return text.upper() in MISSING_GARDNER_TOKENS
 
 
-def normalize_gardner_exp(value, exp_max: int = 6) -> Optional[int]:
+def normalize_gardner_exp(value, exp_max: int = 5) -> Optional[int]:
     if _is_missing_token(value):
         return None
     try:
@@ -101,7 +101,7 @@ def normalize_gardner_grade(value) -> Optional[str]:
     return ICM_TE_NUMERIC_MAP.get(num)
 
 
-def parse_gardner_components(gardner: Optional[str], exp_max: int = 6) -> Optional[Tuple[int, Optional[str], Optional[str]]]:
+def parse_gardner_components(gardner: Optional[str], exp_max: int = 5) -> Optional[Tuple[int, Optional[str], Optional[str]]]:
     if gardner is None:
         return None
     if is_gardner_range_label(gardner):
@@ -171,7 +171,7 @@ def gardner_to_morphology_targets(
     exp_value=UNSET,
     icm_value=UNSET,
     te_value=UNSET,
-    exp_max: int = 6,
+    exp_max: int = 5,
 ) -> Dict[str, int]:
     """
     Convert Gardner grade into morphology class IDs for expansion, ICM, and TE.
@@ -199,13 +199,9 @@ def gardner_to_morphology_targets(
     if exp < 1 or exp > exp_max:
         raise ValueError(f"Gardner expansion {exp} out of range for exp_max={exp_max}.")
 
-    if exp < 3:
-        icm = None
-        te = None
-
     exp_mask = 1
-    icm_mask = 1 if icm is not None and exp >= 3 else 0
-    te_mask = 1 if te is not None and exp >= 3 else 0
+    icm_mask = 1 if icm is not None else 0
+    te_mask = 1 if te is not None else 0
 
     exp_classes = list(range(1, exp_max + 1))
     exp_to_id = {value: idx for idx, value in enumerate(exp_classes)}
@@ -214,6 +210,78 @@ def gardner_to_morphology_targets(
         "exp": exp_to_id[exp],
         "icm": ICM_TO_ID[icm] if icm_mask else -1,
         "te": TE_TO_ID[te] if te_mask else -1,
+        "exp_mask": exp_mask,
+        "icm_mask": icm_mask,
+        "te_mask": te_mask,
+    }
+
+
+def _is_missing_silver_token(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and value != value:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return text.upper() in {"ND", "NA", "N/A"}
+
+
+def normalize_silver_exp(value, exp_max: int = 5) -> Optional[int]:
+    """
+    Silver EXP uses 0-based encoding: 0->EXP1, 1->EXP2, ..., 4->EXP5.
+    Returns the 0-based class index in [0, exp_max-1].
+    """
+    if _is_missing_silver_token(value):
+        return None
+    try:
+        exp = int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+    if exp < 0 or exp >= exp_max:
+        return None
+    return exp
+
+
+def normalize_silver_grade(value) -> Optional[int]:
+    """
+    Silver ICM/TE uses 0-based encoding: 0->A, 1->B, 2->C, 3->not defined.
+    Returns 0/1/2 for valid grades, None for undefined/missing.
+    """
+    if _is_missing_silver_token(value):
+        return None
+    text = str(value).strip().upper()
+    if text in {"A", "B", "C"}:
+        return {"A": 0, "B": 1, "C": 2}[text]
+    try:
+        num = int(float(text))
+    except (ValueError, TypeError):
+        return None
+    if num in {0, 1, 2}:
+        return num
+    if num == 3:
+        return None
+    return None
+
+
+def silver_to_morphology_targets(
+    exp_value,
+    icm_value,
+    te_value,
+    exp_max: int = 5,
+) -> Dict[str, int]:
+    exp = normalize_silver_exp(exp_value, exp_max=exp_max)
+    icm = normalize_silver_grade(icm_value)
+    te = normalize_silver_grade(te_value)
+    if exp is None:
+        raise ValueError("Silver EXP label missing or invalid.")
+    exp_mask = 1
+    icm_mask = 1 if icm is not None else 0
+    te_mask = 1 if te is not None else 0
+    return {
+        "exp": exp,
+        "icm": icm if icm_mask else -1,
+        "te": te if te_mask else -1,
         "exp_mask": exp_mask,
         "icm_mask": icm_mask,
         "te_mask": te_mask,
@@ -240,7 +308,8 @@ def q_proxy_from_components(
     def _grade_score(value: str) -> float:
         return {"A": 1.0, "B": 0.5, "C": 0.0}[value]
 
-    exp_norm = max(0.0, min(1.0, (exp - 1) / 5.0))
+    exp_range = max(1, max(EXPANSION_CLASSES) - 1)
+    exp_norm = max(0.0, min(1.0, (exp - 1) / exp_range))
     icm_score = _grade_score(icm)
     te_score = _grade_score(te)
 

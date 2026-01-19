@@ -21,6 +21,7 @@ from ivf.data.splits import split_by_group
 
 MISSING_TOKENS = {"", "0", "ND", "NA", "N/A"}
 ICM_TE_MAP = {1: "A", 2: "B", 3: "C"}
+ICM_TE_ZERO_BASED_MAP = {0: "A", 1: "B", 2: "C"}
 
 
 def _is_missing(value) -> bool:
@@ -34,15 +35,45 @@ def _is_missing(value) -> bool:
     return text.upper() in MISSING_TOKENS
 
 
-def _parse_int(value) -> Optional[int]:
-    if _is_missing(value):
+def _parse_int(value, allow_zero: bool = False) -> Optional[int]:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper in {"ND", "NA", "N/A"}:
+        return None
+    if not allow_zero and upper == "0":
         return None
     try:
-        num = int(float(value))
+        num = int(float(text))
     except (TypeError, ValueError):
         return None
-    if num == 0:
+    if not allow_zero and num == 0:
         return None
+    return num
+
+
+def _parse_exp(value, zero_based: bool) -> Optional[int]:
+    num = _parse_int(value, allow_zero=zero_based)
+    if num is None:
+        return None
+    if zero_based:
+        if num < 0 or num > 4:
+            return None
+        return num + 1
+    return num
+
+
+def _parse_icm_te(value, zero_based: bool) -> Optional[int]:
+    num = _parse_int(value, allow_zero=zero_based)
+    if num is None:
+        return None
+    if zero_based:
+        if num < 0 or num > 2:
+            return None
+        return num + 1
     return num
 
 
@@ -104,12 +135,16 @@ def _load_label_source(
             raise ValueError(f"{source} file missing {col} column: {path}")
 
     label_map: Dict[str, Dict] = {}
+    zero_based = exp_col.lower().endswith("_silver") or exp_col.lower().endswith("_gold")
+    zero_based = zero_based or icm_col.lower().endswith("_silver") or icm_col.lower().endswith("_gold")
+    zero_based = zero_based or te_col.lower().endswith("_silver") or te_col.lower().endswith("_gold")
+
     for group_idx, (basename, group) in enumerate(df.groupby("Image", sort=False)):
         entries = []
         for row_idx, (_, row) in enumerate(group.iterrows()):
-            exp = _parse_int(row.get(exp_col))
-            icm = _parse_int(row.get(icm_col))
-            te = _parse_int(row.get(te_col))
+            exp = _parse_exp(row.get(exp_col), zero_based=zero_based)
+            icm = _parse_icm_te(row.get(icm_col), zero_based=zero_based)
+            te = _parse_icm_te(row.get(te_col), zero_based=zero_based)
             entries.append(
                 {
                     "exp": exp,

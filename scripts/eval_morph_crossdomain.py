@@ -23,7 +23,15 @@ from omegaconf import OmegaConf
 
 from ivf.config import load_experiment_config
 from ivf.data.datasets import BaseImageDataset, collate_batch, make_full_target_dict
-from ivf.data.label_schema import ICM_CLASSES, TE_CLASSES, ICM_TO_ID, TE_TO_ID, normalize_gardner_exp, normalize_gardner_grade, parse_gardner_components
+from ivf.data.label_schema import (
+    ICM_CLASSES,
+    TE_CLASSES,
+    ICM_TO_ID,
+    TE_TO_ID,
+    normalize_gardner_exp,
+    normalize_gardner_grade,
+    parse_gardner_components,
+)
 from ivf.data.transforms import assert_no_augmentation, get_eval_transforms
 from ivf.models.factory import build_model_from_config
 from ivf.morphology import morph_score
@@ -34,6 +42,52 @@ def _pick_col(df: pd.DataFrame, candidates) -> Optional[str]:
     for name in candidates:
         if name in df.columns:
             return name
+    return None
+
+
+def _is_zero_based(col_name: Optional[str]) -> bool:
+    if not col_name:
+        return False
+    lower = col_name.lower()
+    return lower.endswith("_silver") or lower.endswith("_gold")
+
+
+def _coerce_int(value) -> Optional[int]:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    text = str(value).strip()
+    if not text or text.upper() in {"ND", "NA", "N/A"}:
+        return None
+    try:
+        return int(float(text))
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_zero_based_exp(value, exp_max: int) -> Optional[int]:
+    num = _coerce_int(value)
+    if num is None:
+        return None
+    if num < 0 or num > exp_max - 1:
+        return None
+    return num + 1
+
+
+def _normalize_zero_based_grade(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if text in {"A", "B", "C"}:
+        return text
+    num = _coerce_int(value)
+    if num is None:
+        return None
+    if num == 0:
+        return "A"
+    if num == 1:
+        return "B"
+    if num == 2:
+        return "C"
     return None
 
 
@@ -67,6 +121,10 @@ def _build_records(
     day_col: Optional[str],
 ):
     records = []
+    exp_zero_based = _is_zero_based(exp_col)
+    icm_zero_based = _is_zero_based(icm_col)
+    te_zero_based = _is_zero_based(te_col)
+
     for _, row in df.iterrows():
         image_path = row.get(image_col)
         if pd.isna(image_path):
@@ -80,11 +138,20 @@ def _build_records(
         icm_raw = row.get(icm_col) if icm_col else None
         te_raw = row.get(te_col) if te_col else None
 
-        exp = normalize_gardner_exp(exp_raw, exp_max=exp_max)
+        if exp_zero_based:
+            exp = _normalize_zero_based_exp(exp_raw, exp_max=exp_max)
+        else:
+            exp = normalize_gardner_exp(exp_raw, exp_max=exp_max)
         if exp is None and components is not None:
             exp = components[0]
-        icm = normalize_gardner_grade(icm_raw)
-        te = normalize_gardner_grade(te_raw)
+        if icm_zero_based:
+            icm = _normalize_zero_based_grade(icm_raw)
+        else:
+            icm = normalize_gardner_grade(icm_raw)
+        if te_zero_based:
+            te = _normalize_zero_based_grade(te_raw)
+        else:
+            te = normalize_gardner_grade(te_raw)
         if icm is None and components is not None:
             icm = components[1]
         if te is None and components is not None:
@@ -92,16 +159,10 @@ def _build_records(
 
         exp_id = exp - 1 if exp is not None else None
         exp_mask = 1 if exp_id is not None else 0
-        if exp is None or exp < 3:
-            icm_id = None
-            te_id = None
-            icm_mask = 0
-            te_mask = 0
-        else:
-            icm_id = ICM_TO_ID.get(icm) if icm is not None else None
-            te_id = TE_TO_ID.get(te) if te is not None else None
-            icm_mask = 1 if icm_id is not None else 0
-            te_mask = 1 if te_id is not None else 0
+        icm_id = ICM_TO_ID.get(icm) if icm is not None else None
+        te_id = TE_TO_ID.get(te) if te is not None else None
+        icm_mask = 1 if icm_id is not None else 0
+        te_mask = 1 if te_id is not None else 0
 
         targets = make_full_target_dict(
             exp=exp_id,
@@ -178,7 +239,7 @@ def main() -> None:
     cfg = load_experiment_config(args.config)
 
     morph_cfg = getattr(cfg.training, "morph", None)
-    exp_max = int(getattr(morph_cfg, "exp_max", 6)) if morph_cfg is not None else 6
+    exp_max = int(getattr(morph_cfg, "exp_max", 5)) if morph_cfg is not None else 5
 
     data_cfg = None
     if cfg.data and cfg.data.blastocyst_config:
@@ -274,8 +335,8 @@ def main() -> None:
 
                 meta_item = meta[i] if isinstance(meta, list) else {}
                 image_id = meta_item.get("id", str(i))
-                valid_icm = icm_mask if exp_mask else pred_exp >= 3
-                valid_te = te_mask if exp_mask else pred_exp >= 3
+                valid_icm = icm_mask
+                valid_te = te_mask
                 q_score = morph_score(
                     exp_probs[i],
                     icm_probs[i],

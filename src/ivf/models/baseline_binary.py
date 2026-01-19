@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torchvision import models
 
-from ivf.models.encoder import ConvNeXtMini
+from ivf.models.morph_backbone import MorphologyBackbone
 
 
 def _build_head(in_dim: int, head: str, mlp_hidden: int, dropout: float) -> nn.Module:
@@ -37,13 +37,12 @@ class BaselineBinaryClassifier(nn.Module):
     ) -> None:
         super().__init__()
         self.backbone = backbone
-        if backbone == "convnext_mini":
+        if backbone in {"morph_backbone", "convnext_mini"}:
             dims = list(dims) if dims is not None else [32, 64, 128]
-            self.encoder = ConvNeXtMini(
+            self.encoder = MorphologyBackbone(
                 in_channels=in_channels,
                 dims=dims,
                 feature_dim=feature_dim,
-                weights_path=weights_path,
             )
             encoder_dim = feature_dim
         elif backbone == "resnet50":

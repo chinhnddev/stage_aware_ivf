@@ -2,6 +2,8 @@ base_config: configs/experiment/base.yaml
 
 model:
   name: joint_morph
+  fusion_mode: sum
+  attention_type: eca
 
 transforms:
   image_size: 224
@@ -13,6 +15,10 @@ transforms:
   enable_vertical_flip: false
 
 training:
+  use_cosine_warmup: true
+  warmup_epochs: 5
+  min_lr: 0.000001
+  ema_decay: 0.999
   morph:
     mode: single_task
     single_task_head: exp

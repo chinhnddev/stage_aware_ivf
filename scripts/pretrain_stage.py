@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 
 from ivf.data.datasets import BaseImageDataset, collate_batch, make_full_target_dict
 from ivf.data.transforms import get_eval_transforms, get_train_transforms
-from ivf.models.encoder import ConvNeXtMini
+from ivf.models.morph_backbone import MorphologyBackbone
 from ivf.models.heads import StageHead
 from ivf.utils.logging import configure_logging
 from ivf.utils.paths import ensure_outputs_dir
@@ -188,12 +188,16 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_batch)
 
     model_cfg = cfg.model
-    encoder = ConvNeXtMini(
+    encoder = MorphologyBackbone(
         in_channels=3,
         dims=list(model_cfg.dims),
         feature_dim=int(model_cfg.feature_dim),
         width_mult=float(getattr(model_cfg, "width_mult", 1.0)),
         depth_mult=float(getattr(model_cfg, "depth_mult", 1.0)),
+        blocks_per_stage=int(getattr(model_cfg, "blocks_per_stage", 2)),
+        fusion_mode=str(getattr(model_cfg, "fusion_mode", "concat")),
+        attention_type=str(getattr(model_cfg, "attention_type", "eca")),
+        attention_kernel=int(getattr(model_cfg, "attention_kernel", 3)),
     )
     model = StagePretrainNet(encoder, feature_dim=encoder.feature_dim, num_classes=len(stage_to_idx))
     total_params = sum(p.numel() for p in model.parameters())
@@ -201,6 +205,7 @@ def main() -> None:
 
     device = args.device or cfg.device
     device = torch.device(device if torch.cuda.is_available() and str(device).startswith("cuda") else "cpu")
+    use_amp = device.type == "cuda"
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.training.lr), weight_decay=float(cfg.training.weight_decay))
@@ -208,8 +213,10 @@ def main() -> None:
     warmup_steps = int(cfg.training.warmup_epochs) * len(train_loader)
     scheduler = _build_scheduler(optimizer, warmup_steps, total_steps)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     f1_metric = MulticlassF1Score(num_classes=len(stage_to_idx), average="macro").to(device)
+    if len(val_ds) == 0:
+        logger.warning("Val split is empty; best checkpoint will be based on val_macro_f1=0.0.")
 
     best_f1 = -1.0
     history = []
@@ -220,7 +227,7 @@ def main() -> None:
             images = batch["image"].to(device, non_blocking=True)
             targets = batch["targets"]["stage"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 logits = model(images)
                 loss = F.cross_entropy(logits, targets)
             scaler.scale(loss).backward()

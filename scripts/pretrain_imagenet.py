@@ -21,7 +21,7 @@ sys.path.append(str(ROOT / "src"))
 
 from omegaconf import OmegaConf
 
-from ivf.models.encoder import ConvNeXtMini
+from ivf.models.morph_backbone import MorphologyBackbone
 
 
 class ImageNetClassifier(nn.Module):
@@ -168,12 +168,16 @@ def main() -> None:
     randaugment = bool(getattr(cfg.training, "randaugment", True))
 
     model_cfg = cfg.model
-    encoder = ConvNeXtMini(
+    encoder = MorphologyBackbone(
         in_channels=3,
         dims=list(model_cfg.dims),
         feature_dim=int(model_cfg.feature_dim),
         width_mult=float(getattr(model_cfg, "width_mult", 1.0)),
         depth_mult=float(getattr(model_cfg, "depth_mult", 1.0)),
+        blocks_per_stage=int(getattr(model_cfg, "blocks_per_stage", 2)),
+        fusion_mode=str(getattr(model_cfg, "fusion_mode", "concat")),
+        attention_type=str(getattr(model_cfg, "attention_type", "eca")),
+        attention_kernel=int(getattr(model_cfg, "attention_kernel", 3)),
     )
     model = ImageNetClassifier(encoder, feature_dim=encoder.feature_dim, num_classes=1000)
     total_params = sum(p.numel() for p in model.parameters())

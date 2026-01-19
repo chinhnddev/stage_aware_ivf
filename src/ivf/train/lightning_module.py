@@ -2,6 +2,7 @@
 Lightning module for multi-phase IVF training.
 """
 
+import math
 import time
 import sys
 from typing import Dict, Optional
@@ -21,6 +22,26 @@ from ivf.utils.guardrails import assert_no_day_feature, assert_no_segmentation_i
 from ivf.utils.logging import get_logger
 
 
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+
+    def apply_to(self, model: nn.Module):
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=False)
+        return backup
+
+    def restore(self, model: nn.Module, backup) -> None:
+        if backup:
+            model.load_state_dict(backup, strict=False)
+
+
 class MultiTaskLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -28,6 +49,10 @@ class MultiTaskLightningModule(pl.LightningModule):
         phase: str,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
+        use_cosine_warmup: bool = False,
+        warmup_epochs: int = 5,
+        min_lr: float = 0.0,
+        ema_decay: float = 0.0,
         loss_weights: Optional[Dict[str, float]] = None,
         freeze_config: Optional[Dict] = None,
         morph_loss_reduction: str = "mean",
@@ -35,12 +60,20 @@ class MultiTaskLightningModule(pl.LightningModule):
         single_task_head: Optional[str] = None,
         mtl_grad_strategy: str = "none",
         exp_num_classes: Optional[int] = None,
+        morph_lambda_icm: float = 1.0,
+        morph_lambda_te: float = 1.0,
         quality_pos_weight: Optional[float] = None,
         use_class_weights: bool = False,
         class_weight_mode: str = "inverse_freq",
+        morph_class_weights_exp: Optional[list] = None,
+        morph_class_weights_icm: Optional[list] = None,
+        morph_class_weights_te: Optional[list] = None,
         q_loss: str = "smoothl1",
         q_aux_alpha: float = 0.0,
         q_freeze_backbone: bool = True,
+        use_focal_icm: bool = False,
+        use_focal_te: bool = False,
+        focal_gamma: float = 2.0,
         live_epoch_line: bool = False,
     ) -> None:
         super().__init__()
@@ -48,6 +81,12 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.phase = phase
         self.lr = lr
         self.weight_decay = weight_decay
+        self.use_cosine_warmup = use_cosine_warmup
+        self.warmup_epochs = warmup_epochs
+        self.min_lr = min_lr
+        self.ema_decay = ema_decay
+        self.ema = EMA(self.model, decay=ema_decay) if ema_decay > 0 else None
+        self._ema_backup = None
         self.loss_weights = loss_weights or {"morph": 1.0, "stage": 1.0, "quality": 1.0}
         if self.phase == "morph":
             self.loss_weights = dict(self.loss_weights)
@@ -59,9 +98,14 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.morph_mode = morph_mode
         self.single_task_head = single_task_head
         self.mtl_grad_strategy = mtl_grad_strategy
+        self.morph_lambda_icm = morph_lambda_icm
+        self.morph_lambda_te = morph_lambda_te
         self.quality_pos_weight = quality_pos_weight
         self.use_class_weights = use_class_weights
         self.class_weight_mode = class_weight_mode
+        self.morph_class_weights_exp = morph_class_weights_exp
+        self.morph_class_weights_icm = morph_class_weights_icm
+        self.morph_class_weights_te = morph_class_weights_te
         self.q_loss = q_loss
         self.q_aux_alpha = q_aux_alpha
         self.q_freeze_backbone = q_freeze_backbone
@@ -82,9 +126,9 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.exp_class_counts = None
         self.icm_class_counts = None
         self.te_class_counts = None
-        self.focal_gamma = 2.0
-        self.use_focal_icm = False
-        self.use_focal_te = False
+        self.focal_gamma = focal_gamma
+        self.use_focal_icm = use_focal_icm
+        self.use_focal_te = use_focal_te
 
         if self.morph_loss_reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported morph_loss_reduction: {self.morph_loss_reduction}")
@@ -206,6 +250,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         self._next_progress_pct = 25.0
 
     def on_fit_start(self) -> None:
+        logger = get_logger("ivf")
+        if self.use_cosine_warmup:
+            logger.info("LR schedule: cosine+warmup warmup_epochs=%s min_lr=%s", self.warmup_epochs, self.min_lr)
+        if self.ema is not None:
+            logger.info("EMA enabled: decay=%s", self.ema_decay)
         if self.phase not in {"morph", "joint"}:
             return
         if self.icm_class_weight is not None or self.te_class_weight is not None:
@@ -213,6 +262,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         self._setup_morph_class_weights()
 
     def on_validation_epoch_start(self) -> None:
+        if self.ema is not None and self.trainer and not getattr(self.trainer, "sanity_checking", False):
+            self._ema_backup = self.ema.apply_to(self.model)
         if self.phase in {"morph", "joint"}:
             self._val_pred_counts = {
                 "icm": torch.zeros(self.icm_num_classes, dtype=torch.long),
@@ -265,9 +316,67 @@ class MultiTaskLightningModule(pl.LightningModule):
         while self._next_progress_pct is not None and progress >= self._next_progress_pct:
             self._next_progress_pct += 25.0
 
+        if self.ema is not None:
+            self.ema.update(self.model)
+
+    def _estimate_total_steps(self) -> Optional[int]:
+        if not self.trainer:
+            return None
+        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
+        if total_steps is None:
+            num_batches = getattr(self.trainer, "num_training_batches", None)
+            max_epochs = getattr(self.trainer, "max_epochs", None)
+            if isinstance(num_batches, int) and isinstance(max_epochs, int):
+                total_steps = num_batches * max_epochs
+        if total_steps is None:
+            return None
+        try:
+            return int(total_steps)
+        except (TypeError, ValueError):
+            return None
+
+    def _build_lr_scheduler(self, optimizer):
+        total_steps = self._estimate_total_steps()
+        if not total_steps or total_steps <= 0:
+            return None
+        max_epochs = getattr(self.trainer, "max_epochs", 1) if self.trainer else 1
+        steps_per_epoch = total_steps / max(1, max_epochs)
+        warmup_steps = int(self.warmup_epochs * steps_per_epoch)
+        base_lr = float(self.lr)
+        min_lr = float(self.min_lr)
+        min_ratio = min_lr / base_lr if base_lr > 0 else 0.0
+
+        def _lr_lambda(step):
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    def _step_schedulers(self) -> None:
+        schedulers = self.lr_schedulers()
+        if schedulers is None:
+            return
+        if isinstance(schedulers, (list, tuple)):
+            for scheduler in schedulers:
+                scheduler.step()
+        else:
+            schedulers.step()
+
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]
-        return torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        optimizer = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        if not self.use_cosine_warmup:
+            return optimizer
+        scheduler = self._build_lr_scheduler(optimizer)
+        if scheduler is None:
+            return optimizer
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     def _guardrails(self, batch: Dict) -> None:
         assert_no_day_feature(batch)
@@ -354,6 +463,7 @@ class MultiTaskLightningModule(pl.LightningModule):
 
     def _compute_morph_task_losses(self, outputs: Dict, targets: Dict) -> Dict[str, Optional[torch.Tensor]]:
         losses = {"exp": None, "icm": None, "te": None}
+        base_weight = float(self.loss_weights.get("morph", 1.0))
         if not self._is_head_active("exp"):
             pass
         else:
@@ -361,7 +471,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                 outputs["morph"]["exp"],
                 targets["exp"],
                 targets.get("exp_mask"),
-                self.loss_weights.get("morph", 1.0),
+                base_weight,
                 class_weight=self.exp_class_weight,
                 num_classes=self.exp_num_classes,
             )
@@ -372,7 +482,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     outputs["morph"]["icm"],
                     targets["icm"],
                     targets.get("icm_mask"),
-                    self.loss_weights.get("morph", 1.0),
+                    base_weight * float(self.morph_lambda_icm),
                     gamma=self.focal_gamma,
                     class_weight=self.icm_class_weight,
                     num_classes=self.icm_num_classes,
@@ -382,7 +492,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     outputs["morph"]["icm"],
                     targets["icm"],
                     targets.get("icm_mask"),
-                    self.loss_weights.get("morph", 1.0),
+                    base_weight * float(self.morph_lambda_icm),
                     class_weight=self.icm_class_weight,
                     num_classes=self.icm_num_classes,
                 )
@@ -393,7 +503,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     outputs["morph"]["te"],
                     targets["te"],
                     targets.get("te_mask"),
-                    self.loss_weights.get("morph", 1.0),
+                    base_weight * float(self.morph_lambda_te),
                     gamma=self.focal_gamma,
                     class_weight=self.te_class_weight,
                     num_classes=self.te_num_classes,
@@ -403,7 +513,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                     outputs["morph"]["te"],
                     targets["te"],
                     targets.get("te_mask"),
-                    self.loss_weights.get("morph", 1.0),
+                    base_weight * float(self.morph_lambda_te),
                     class_weight=self.te_class_weight,
                     num_classes=self.te_num_classes,
                 )
@@ -579,6 +689,8 @@ class MultiTaskLightningModule(pl.LightningModule):
                     optimizer.step()
                 else:
                     self._pcgrad_update(active_losses, optimizer)
+                if self.use_cosine_warmup:
+                    self._step_schedulers()
             losses = {"total": total, "morphology": total}
         else:
             losses = self._compute_losses(outputs, batch["targets"])
@@ -628,6 +740,15 @@ class MultiTaskLightningModule(pl.LightningModule):
                     preds = outputs["morph"]["exp"][:, : self.exp_num_classes].argmax(dim=-1)
                     self.morph_metrics["exp_acc"].update(preds[mask], t[mask])
                     self.log("val/exp_acc", self.morph_metrics["exp_acc"], on_epoch=True, prog_bar=False, batch_size=batch_size)
+                    if "exp_macro_f1" in self.morph_metrics:
+                        self.morph_metrics["exp_macro_f1"].update(preds[mask], t[mask])
+                        self.log(
+                            "val/exp_macro_f1",
+                            self.morph_metrics["exp_macro_f1"],
+                            on_epoch=True,
+                            prog_bar=False,
+                            batch_size=batch_size,
+                        )
 
             for head, num_classes in (("icm", self.icm_num_classes), ("te", self.te_num_classes)):
                 if not self._is_head_active(head):
@@ -744,6 +865,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         if self.phase in {"morph", "joint"}:
             if self._is_head_active("exp"):
                 _append(parts, "val_exp_acc", "val/exp_acc")
+                _append(parts, "val_exp_f1", "val/exp_macro_f1")
             if self._is_head_active("icm"):
                 _append(parts, "val_icm_acc", "val/icm_acc")
             if self._is_head_active("te"):
@@ -857,6 +979,21 @@ class MultiTaskLightningModule(pl.LightningModule):
         for metric in list(self.morph_metrics.values()) + list(self.stage_metrics.values()) + list(self.quality_metrics.values()):
             metric.reset()
 
+        if self._ema_backup is not None and self.ema is not None:
+            self.ema.restore(self.model, self._ema_backup)
+            self._ema_backup = None
+
+    def on_save_checkpoint(self, checkpoint: Dict) -> None:
+        if self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.shadow
+
+    def on_load_checkpoint(self, checkpoint: Dict) -> None:
+        if self.ema is None:
+            return
+        ema_state = checkpoint.get("ema_state_dict")
+        if ema_state is not None:
+            self.ema.shadow = ema_state
+
     def _setup_morph_class_weights(self) -> None:
         if not self.trainer or not hasattr(self.trainer, "datamodule"):
             return
@@ -939,11 +1076,21 @@ class MultiTaskLightningModule(pl.LightningModule):
                 else:
                     weights[i] = 0.0
             return weights
+        def _override_weights(values, num_classes: int, head: str) -> Optional[torch.Tensor]:
+            if values is None:
+                return None
+            if len(values) != num_classes:
+                raise ValueError(f"{head} class_weights length={len(values)} does not match num_classes={num_classes}.")
+            return torch.tensor(values, dtype=torch.float)
 
-        if self.use_class_weights:
-            self.exp_class_weight = _compute_weights("exp", self.exp_num_classes)
-            self.icm_class_weight = _compute_weights("icm", self.icm_num_classes)
-            self.te_class_weight = _compute_weights("te", self.te_num_classes)
+        exp_override = _override_weights(self.morph_class_weights_exp, self.exp_num_classes, "EXP")
+        icm_override = _override_weights(self.morph_class_weights_icm, self.icm_num_classes, "ICM")
+        te_override = _override_weights(self.morph_class_weights_te, self.te_num_classes, "TE")
+
+        if exp_override is not None or icm_override is not None or te_override is not None or self.use_class_weights:
+            self.exp_class_weight = exp_override if exp_override is not None else _compute_weights("exp", self.exp_num_classes)
+            self.icm_class_weight = icm_override if icm_override is not None else _compute_weights("icm", self.icm_num_classes)
+            self.te_class_weight = te_override if te_override is not None else _compute_weights("te", self.te_num_classes)
             if self.exp_class_weight is not None:
                 logger.info("EXP class weights: %s", self.exp_class_weight.tolist())
             if self.icm_class_weight is not None:
@@ -958,8 +1105,6 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         icm_ratio = _imbalance_ratio(counts["icm"], self.icm_num_classes)
         te_ratio = _imbalance_ratio(counts["te"], self.te_num_classes)
-        self.use_focal_icm = icm_ratio is not None and icm_ratio > 3.0
-        self.use_focal_te = te_ratio is not None and te_ratio > 3.0
         logger.info(
             "Morph icm imbalance ratio=%s focal=%s gamma=%s",
             "n/a" if icm_ratio is None else ("inf" if icm_ratio == float("inf") else f"{icm_ratio:.2f}"),

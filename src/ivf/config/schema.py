@@ -25,6 +25,10 @@ class ModelConfig:
     name: str = "multitask"
     width_mult: float = 1.0
     depth_mult: float = 1.0
+    fusion_mode: str = "sum"
+    attention_type: str = "eca"
+    attention_kernel: int = 3
+    head_hidden_dim: int = 128
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     heads: HeadsConfig = field(default_factory=HeadsConfig)
     encoder_config: Optional[str] = None
@@ -70,11 +74,19 @@ class FreezeConfig:
 class MorphTrainingConfig:
     use_class_weights: bool = False
     class_weight_mode: str = "inverse_freq"
+    class_weights_exp: Optional[List[float]] = None
+    class_weights_icm: Optional[List[float]] = None
+    class_weights_te: Optional[List[float]] = None
     balance_icm_te: bool = False
     labeled_mix_ratio: float = 0.5
     mode: str = "multi_task"
     single_task_head: str = "exp"
-    exp_max: int = 6
+    exp_max: int = 5
+    lambda_icm: float = 1.0
+    lambda_te: float = 1.0
+    use_focal_icm: bool = False
+    use_focal_te: bool = False
+    focal_gamma: float = 2.0
     finetune_stage1_epochs: int = 5
     finetune_stage2_epochs: int = 15
     finetune_stage1_lr: float = 1e-4
@@ -107,6 +119,10 @@ class TrainingConfig:
     weight_decay: float = 0.0001
     init_ckpt_imagenet: Optional[str] = None
     init_ckpt_stage: Optional[str] = None
+    use_cosine_warmup: bool = False
+    warmup_epochs: int = 5
+    min_lr: float = 0.0
+    ema_decay: float = 0.0
     epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10, "q": 10, "baseline": 10})
     loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0, "q": 1.0})
     morph_loss_reduction: str = "mean"

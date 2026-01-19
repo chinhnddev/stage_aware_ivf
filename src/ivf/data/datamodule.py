@@ -14,8 +14,10 @@ from ivf.data.datasets import BaseImageDataset, IGNORE_INDEX, collate_batch, mak
 from ivf.data.label_schema import (
     EXPANSION_CLASSES,
     ICM_CLASSES,
+    ICM_TO_ID,
     QUALITY_TO_ID,
     STAGE_TO_ID,
+    TE_TO_ID,
     TE_CLASSES,
     QualityLabel,
     StageLabel,
@@ -25,6 +27,8 @@ from ivf.data.label_schema import (
     map_gardner_to_quality,
     normalize_gardner_exp,
     normalize_gardner_grade,
+    normalize_silver_exp,
+    normalize_silver_grade,
     parse_gardner_components,
     q_proxy_from_components,
 )
@@ -122,12 +126,41 @@ def _assert_no_group_overlap_dfs(
 def _is_missing_token(value) -> bool:
     if value is None or pd.isna(value):
         return True
-    if isinstance(value, (int, float)) and value == 0:
-        return True
     text = str(value).strip()
     if not text:
         return True
-    return text.upper() in {"", "0", "ND", "NA", "N/A"}
+    return text.upper() in {"", "ND", "NA", "N/A"}
+
+
+def _infer_zero_based(series: pd.Series, max_value: int) -> bool:
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = numeric[~numeric.isna()]
+    if numeric.empty:
+        return False
+    vmax = int(numeric.max())
+    vmin = int(numeric.min())
+    return vmin >= 0 and vmax <= max_value
+
+
+def _assert_silver_range(value, allowed, field: str, context: str) -> None:
+    if _is_missing_token(value):
+        return
+    try:
+        num = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        raise ValueError(f"{context} invalid {field} label (non-numeric): {value!r}")
+    if num not in allowed:
+        raise ValueError(f"{context} invalid {field} label {num}; allowed={sorted(allowed)}")
+
+
+def _is_silver_undefined(value) -> bool:
+    if _is_missing_token(value):
+        return False
+    try:
+        num = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return False
+    return num == 3
 
 
 def _log_morphology_train_stats(records: list, context: str) -> None:
@@ -218,7 +251,7 @@ def _build_morphology_records(
     include_meta_day: bool,
     context: str,
     drop_missing_icm_te: bool = False,
-    exp_max: int = 6,
+    exp_max: int = 5,
 ) -> list:
     records = []
     has_exp_col = "exp" in df.columns
@@ -241,6 +274,16 @@ def _build_morphology_records(
     exp_counts = {exp: 0 for exp in exp_classes}
     icm_counts = {"A": 0, "B": 0, "C": 0}
     te_counts = {"A": 0, "B": 0, "C": 0}
+    exp_zero_based = has_exp_col and _infer_zero_based(df["exp"], max_value=exp_max - 1)
+    icm_zero_based = has_icm_col and _infer_zero_based(df["icm"], max_value=3)
+    te_zero_based = has_te_col and _infer_zero_based(df["te"], max_value=3)
+    get_logger("ivf").info(
+        "Morph label encoding (%s): exp_zero_based=%s icm_zero_based=%s te_zero_based=%s",
+        context,
+        exp_zero_based,
+        icm_zero_based,
+        te_zero_based,
+    )
     for _, row in df.iterrows():
         stats["total"] += 1
         grade = row.get("grade")
@@ -251,10 +294,21 @@ def _build_morphology_records(
         icm_raw = row.get("icm") if has_icm_col else None
         te_raw = row.get("te") if has_te_col else None
         components = parse_gardner_components(grade, exp_max=exp_max)
-        exp = normalize_gardner_exp(exp_raw, exp_max=exp_max)
-        if exp is None and components is not None:
-            exp = components[0]
-        if exp is None:
+        exp_id = None
+        exp_value = None
+        if has_exp_col:
+            if exp_zero_based:
+                _assert_silver_range(exp_raw, set(range(exp_max)), "exp", context)
+                exp_id = normalize_silver_exp(exp_raw, exp_max=exp_max)
+            else:
+                exp_val = normalize_gardner_exp(exp_raw, exp_max=exp_max)
+                exp_id = (exp_val - 1) if exp_val is not None else None
+        if exp_id is None and components is not None:
+            exp_id = components[0] - 1
+        if exp_id is not None:
+            exp_value = exp_id + 1
+
+        if exp_id is None:
             if _is_missing_token(exp_raw) or (exp_raw is None and components is None):
                 stats["missing_exp"] += 1
             else:
@@ -286,72 +340,95 @@ def _build_morphology_records(
             )
             stats["kept"] += 1
             continue
-        exp_counts[exp] += 1
-        if exp < 3:
+
+        exp_counts[exp_value] += 1
+        if exp_value < 3:
             stats["exp_lt3"] += 1
-        icm_norm = normalize_gardner_grade(icm_raw) if has_icm_col else (components[1] if components else None)
-        te_norm = normalize_gardner_grade(te_raw) if has_te_col else (components[2] if components else None)
-        if exp >= 3:
-            if has_icm_col:
+
+        icm_id = None
+        te_id = None
+        icm_norm = None
+        te_norm = None
+
+        if has_icm_col:
+            if icm_zero_based:
+                _assert_silver_range(icm_raw, {0, 1, 2, 3}, "icm", context)
+                icm_id = normalize_silver_grade(icm_raw)
+                if _is_missing_token(icm_raw) or _is_silver_undefined(icm_raw):
+                    stats["missing_icm"] += 1
+                elif icm_id is None:
+                    stats["invalid_icm"] += 1
+            else:
+                icm_norm = normalize_gardner_grade(icm_raw)
                 if _is_missing_token(icm_raw):
                     stats["missing_icm"] += 1
                 elif icm_norm is None:
                     stats["invalid_icm"] += 1
+                else:
+                    icm_id = ICM_TO_ID.get(icm_norm)
+        else:
+            icm_norm = components[1] if components else None
+            if icm_norm is None:
+                stats["missing_icm"] += 1
+            elif icm_norm in ICM_CLASSES:
+                icm_id = ICM_TO_ID.get(icm_norm)
+
+        if has_te_col:
+            if te_zero_based:
+                _assert_silver_range(te_raw, {0, 1, 2, 3}, "te", context)
+                te_id = normalize_silver_grade(te_raw)
+                if _is_missing_token(te_raw) or _is_silver_undefined(te_raw):
+                    stats["missing_te"] += 1
+                elif te_id is None:
+                    stats["invalid_te"] += 1
             else:
-                if components is None or components[1] is None:
-                    stats["missing_icm"] += 1
-            if has_te_col:
+                te_norm = normalize_gardner_grade(te_raw)
                 if _is_missing_token(te_raw):
                     stats["missing_te"] += 1
                 elif te_norm is None:
                     stats["invalid_te"] += 1
-            else:
-                if components is None or components[2] is None:
-                    stats["missing_te"] += 1
-            if drop_missing_icm_te and (icm_norm is None or te_norm is None):
-                stats["dropped_missing_icm_te"] += 1
-                continue
-        try:
-            morph = gardner_to_morphology_targets(
-                grade,
-                exp_value=exp,
-                icm_value=icm_raw if has_icm_col else UNSET,
-                te_value=te_raw if has_te_col else UNSET,
-                exp_max=exp_max,
-            )
-        except ValueError:
-            stats["invalid_exp"] += 1
+                else:
+                    te_id = TE_TO_ID.get(te_norm)
+        else:
+            te_norm = components[2] if components else None
+            if te_norm is None:
+                stats["missing_te"] += 1
+            elif te_norm in TE_CLASSES:
+                te_id = TE_TO_ID.get(te_norm)
+
+        if drop_missing_icm_te and (icm_id is None or te_id is None):
+            stats["dropped_missing_icm_te"] += 1
             continue
 
         targets = make_full_target_dict(
-            exp=morph["exp"],
-            icm=morph["icm"],
-            te=morph["te"],
-            exp_mask=morph.get("exp_mask"),
-            icm_mask=morph.get("icm_mask"),
-            te_mask=morph.get("te_mask"),
+            exp=exp_id,
+            icm=icm_id if icm_id is not None else IGNORE_INDEX,
+            te=te_id if te_id is not None else IGNORE_INDEX,
+            exp_mask=1,
+            icm_mask=1 if icm_id is not None else 0,
+            te_mask=1 if te_id is not None else 0,
         )
-        icm_meta = icm_norm if exp >= 3 and icm_norm in ICM_CLASSES else None
-        te_meta = te_norm if exp >= 3 and te_norm in TE_CLASSES else None
-        if exp < 3:
-            icm_meta = None
-            te_meta = None
+        if icm_norm is None and icm_id is not None:
+            icm_norm = ICM_CLASSES[icm_id]
+        if te_norm is None and te_id is not None:
+            te_norm = TE_CLASSES[te_id]
+
         meta = {
             "id": row.get("id"),
             "dataset": row.get("dataset", "blastocyst"),
             "grade": grade,
-            "exp": exp,
-            "icm": icm_meta,
-            "te": te_meta,
+            "exp": exp_value,
+            "icm": icm_norm if icm_norm in ICM_CLASSES else None,
+            "te": te_norm if te_norm in TE_CLASSES else None,
         }
         if include_meta_day and "day" in row:
             meta["day"] = row.get("day")
+        icm_meta = meta.get("icm")
+        te_meta = meta.get("te")
         if icm_meta in icm_counts:
             icm_counts[icm_meta] += 1
         if te_meta in te_counts:
             te_counts[te_meta] += 1
-        if exp in exp_counts:
-            exp_counts[exp] += 1
         records.append(
             {
                 "image_path": row.get("image_path"),
@@ -375,6 +452,12 @@ def _build_q_records(
 ) -> list:
     records = []
     stats = {"total": 0, "kept": 0, "dropped_missing_gt": 0}
+    has_exp_col = "exp" in df.columns
+    has_icm_col = "icm" in df.columns
+    has_te_col = "te" in df.columns
+    exp_zero_based = has_exp_col and _infer_zero_based(df["exp"], max_value=4)
+    icm_zero_based = has_icm_col and _infer_zero_based(df["icm"], max_value=3)
+    te_zero_based = has_te_col and _infer_zero_based(df["te"], max_value=3)
     for _, row in df.iterrows():
         stats["total"] += 1
         grade = row.get("grade")
@@ -385,9 +468,21 @@ def _build_q_records(
         icm_raw = row.get("icm")
         te_raw = row.get("te")
         components = parse_gardner_components(grade)
-        exp = normalize_gardner_exp(exp_raw)
-        icm = normalize_gardner_grade(icm_raw)
-        te = normalize_gardner_grade(te_raw)
+        if exp_zero_based:
+            exp_id = normalize_silver_exp(exp_raw)
+            exp = exp_id + 1 if exp_id is not None else None
+        else:
+            exp = normalize_gardner_exp(exp_raw)
+        if icm_zero_based:
+            icm_id = normalize_silver_grade(icm_raw)
+            icm = ICM_CLASSES[icm_id] if icm_id is not None else None
+        else:
+            icm = normalize_gardner_grade(icm_raw)
+        if te_zero_based:
+            te_id = normalize_silver_grade(te_raw)
+            te = TE_CLASSES[te_id] if te_id is not None else None
+        else:
+            te = normalize_gardner_grade(te_raw)
         if components is not None:
             if exp is None:
                 exp = components[0]

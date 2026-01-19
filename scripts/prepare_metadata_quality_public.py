@@ -19,6 +19,8 @@ from ivf.data.label_schema import map_gardner_to_quality
 
 
 ICM_TE_MAP: Dict[int, str] = {1: "A", 2: "B", 3: "C"}
+ICM_TE_REV: Dict[str, int] = {v: k for k, v in ICM_TE_MAP.items()}
+ICM_TE_ZERO_BASED_MAP: Dict[int, str] = {0: "A", 1: "B", 2: "C"}
 
 
 def _coerce_int(value) -> Optional[int]:
@@ -33,7 +35,18 @@ def _coerce_int(value) -> Optional[int]:
         return None
 
 
-def _coerce_grade(value) -> Optional[str]:
+def _coerce_exp(value, zero_based: bool) -> Optional[int]:
+    num = _coerce_int(value)
+    if num is None:
+        return None
+    if zero_based:
+        if num < 0 or num > 4:
+            return None
+        return num
+    return num
+
+
+def _coerce_grade(value, zero_based: bool) -> Optional[str]:
     if value is None or pd.isna(value):
         return None
     text = str(value).strip().upper()
@@ -42,20 +55,29 @@ def _coerce_grade(value) -> Optional[str]:
     num = _coerce_int(value)
     if num is None:
         return None
+    if zero_based:
+        return ICM_TE_ZERO_BASED_MAP.get(num)
     return ICM_TE_MAP.get(num)
 
 
-def _build_gardner(exp_val, icm_val, te_val) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
-    exp = _coerce_int(exp_val)
-    icm_grade = _coerce_grade(icm_val)
-    te_grade = _coerce_grade(te_val)
+def _build_gardner(
+    exp_val,
+    icm_val,
+    te_val,
+    exp_zero_based: bool,
+    icm_te_zero_based: bool,
+) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    exp = _coerce_exp(exp_val, zero_based=exp_zero_based)
+    exp_for_grade = exp + 1 if exp_zero_based and exp is not None else exp
+    icm_grade = _coerce_grade(icm_val, zero_based=icm_te_zero_based)
+    te_grade = _coerce_grade(te_val, zero_based=icm_te_zero_based)
     icm = _coerce_int(icm_val)
     te = _coerce_int(te_val)
-    if exp is None or icm_grade is None or te_grade is None:
+    if exp_for_grade is None or icm_grade is None or te_grade is None:
         return None, exp, icm, te
-    if exp < 1 or exp > 6:
+    if exp_for_grade < 1 or exp_for_grade > 5:
         return None, exp, icm, te
-    return f"{exp}{icm_grade}{te_grade}", exp, icm, te
+    return f"{exp_for_grade}{icm_grade}{te_grade}", exp, icm, te
 
 
 def _pick_col(df: pd.DataFrame, candidates) -> Optional[str]:
@@ -63,6 +85,13 @@ def _pick_col(df: pd.DataFrame, candidates) -> Optional[str]:
         if name in df.columns:
             return name
     return None
+
+
+def _is_zero_based(col_name: Optional[str]) -> bool:
+    if not col_name:
+        return False
+    lower = col_name.lower()
+    return lower.endswith("_silver") or lower.endswith("_gold")
 
 
 def _load_split(split_csv: Path, split_name: str, images_dir: Path, logger: logging.Logger) -> pd.DataFrame:
@@ -77,6 +106,9 @@ def _load_split(split_csv: Path, split_name: str, images_dir: Path, logger: logg
     if image_col is None:
         raise ValueError(f"Missing image column in {split_csv}")
 
+    exp_zero_based = _is_zero_based(exp_col)
+    icm_te_zero_based = _is_zero_based(icm_col) or _is_zero_based(te_col)
+
     records = []
     missing_quality = 0
     for _, row in df.iterrows():
@@ -89,6 +121,8 @@ def _load_split(split_csv: Path, split_name: str, images_dir: Path, logger: logg
             row.get(exp_col) if exp_col else None,
             row.get(icm_col) if icm_col else None,
             row.get(te_col) if te_col else None,
+            exp_zero_based=exp_zero_based,
+            icm_te_zero_based=icm_te_zero_based,
         )
         quality = map_gardner_to_quality(grade) if grade else None
         if quality is None:

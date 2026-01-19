@@ -35,6 +35,8 @@ from ivf.data.label_schema import (
     TE_CLASSES,
     normalize_gardner_exp,
     normalize_gardner_grade,
+    normalize_silver_exp,
+    normalize_silver_grade,
     parse_gardner_components,
 )
 from ivf.data.splits import save_splits, split_by_group
@@ -257,15 +259,30 @@ def _extract_morph_labels(row: pd.Series):
     if grade is None:
         grade = row.get("gardner")
     components = parse_gardner_components(grade) if grade is not None else None
-    exp = normalize_gardner_exp(row.get("exp"))
+    exp_raw = row.get("exp")
+    exp_id = normalize_silver_exp(exp_raw)
+    exp = exp_id + 1 if exp_id is not None else None
+    if exp is None:
+        exp = normalize_gardner_exp(exp_raw)
     if exp is None and components is not None:
         exp = components[0]
-    icm = normalize_gardner_grade(row.get("icm"))
-    te = normalize_gardner_grade(row.get("te"))
+
+    icm_raw = row.get("icm")
+    icm_id = normalize_silver_grade(icm_raw)
+    icm = ICM_CLASSES[icm_id] if icm_id is not None else None
+    if icm is None:
+        icm = normalize_gardner_grade(icm_raw)
     if icm is None and components is not None:
         icm = components[1]
+
+    te_raw = row.get("te")
+    te_id = normalize_silver_grade(te_raw)
+    te = TE_CLASSES[te_id] if te_id is not None else None
+    if te is None:
+        te = normalize_gardner_grade(te_raw)
     if te is None and components is not None:
         te = components[2]
+
     return exp, icm, te
 
 
@@ -307,7 +324,7 @@ def _split_by_group_stratified(
     if exp_mode == "exact":
         exp_labels_set = [str(exp) for exp in EXPANSION_CLASSES if exp in exp_counts]
     else:
-        exp_labels_set = ["1-2", "3-6"]
+        exp_labels_set = ["1-2", "3-5"]
 
     exp_labels = []
     icm_labels = []
@@ -319,15 +336,11 @@ def _split_by_group_stratified(
         elif exp_mode == "exact":
             exp_label = str(exp)
         else:
-            exp_label = "1-2" if exp < 3 else "3-6"
+            exp_label = "1-2" if exp < 3 else "3-5"
         exp_labels.append(exp_label)
 
-        if exp is None or exp < 3:
-            icm_label = "missing"
-            te_label = "missing"
-        else:
-            icm_label = icm if icm in ICM_CLASSES else "missing"
-            te_label = te if te in TE_CLASSES else "missing"
+        icm_label = icm if icm in ICM_CLASSES else "missing"
+        te_label = te if te in TE_CLASSES else "missing"
         icm_labels.append(icm_label)
         te_labels.append(te_label)
 
@@ -616,7 +629,11 @@ def _morph_label_distribution(df: pd.DataFrame) -> dict:
     for _, row in df.iterrows():
         grade = row.get("grade")
         components = parse_gardner_components(grade) if grade is not None else None
-        exp = normalize_gardner_exp(row.get("exp"))
+        exp_raw = row.get("exp")
+        exp_id = normalize_silver_exp(exp_raw)
+        exp = exp_id + 1 if exp_id is not None else None
+        if exp is None:
+            exp = normalize_gardner_exp(exp_raw)
         if exp is None and components is not None:
             exp = components[0]
         if exp is None:
@@ -624,10 +641,16 @@ def _morph_label_distribution(df: pd.DataFrame) -> dict:
         n_exp_labeled += 1
         if exp in exp_counts:
             exp_counts[exp] += 1
-        if exp < 3:
-            continue
-        icm = normalize_gardner_grade(row.get("icm"))
-        te = normalize_gardner_grade(row.get("te"))
+        icm_raw = row.get("icm")
+        te_raw = row.get("te")
+        icm_id = normalize_silver_grade(icm_raw)
+        te_id = normalize_silver_grade(te_raw)
+        icm = ICM_CLASSES[icm_id] if icm_id is not None else None
+        te = TE_CLASSES[te_id] if te_id is not None else None
+        if icm is None:
+            icm = normalize_gardner_grade(icm_raw)
+        if te is None:
+            te = normalize_gardner_grade(te_raw)
         if icm is None and components is not None:
             icm = components[1]
         if te is None and components is not None:
@@ -1170,11 +1193,19 @@ def main():
     morph_cfg = getattr(phase_cfg, "morph", None)
     morph_use_class_weights = bool(getattr(morph_cfg, "use_class_weights", False)) if morph_cfg is not None else False
     morph_class_weight_mode = str(getattr(morph_cfg, "class_weight_mode", "inverse_freq")) if morph_cfg is not None else "inverse_freq"
+    morph_class_weights_exp = getattr(morph_cfg, "class_weights_exp", None) if morph_cfg is not None else None
+    morph_class_weights_icm = getattr(morph_cfg, "class_weights_icm", None) if morph_cfg is not None else None
+    morph_class_weights_te = getattr(morph_cfg, "class_weights_te", None) if morph_cfg is not None else None
     morph_balance_icm_te = bool(getattr(morph_cfg, "balance_icm_te", False)) if morph_cfg is not None else False
     morph_labeled_mix_ratio = float(getattr(morph_cfg, "labeled_mix_ratio", 0.5)) if morph_cfg is not None else 0.5
     morph_mode = str(getattr(morph_cfg, "mode", "multi_task")) if morph_cfg is not None else "multi_task"
     morph_single_head = str(getattr(morph_cfg, "single_task_head", "exp")) if morph_cfg is not None else "exp"
-    morph_exp_max = int(getattr(morph_cfg, "exp_max", 6)) if morph_cfg is not None else 6
+    morph_exp_max = int(getattr(morph_cfg, "exp_max", 5)) if morph_cfg is not None else 5
+    morph_lambda_icm = float(getattr(morph_cfg, "lambda_icm", 1.0)) if morph_cfg is not None else 1.0
+    morph_lambda_te = float(getattr(morph_cfg, "lambda_te", 1.0)) if morph_cfg is not None else 1.0
+    morph_use_focal_icm = bool(getattr(morph_cfg, "use_focal_icm", False)) if morph_cfg is not None else False
+    morph_use_focal_te = bool(getattr(morph_cfg, "use_focal_te", False)) if morph_cfg is not None else False
+    morph_focal_gamma = float(getattr(morph_cfg, "focal_gamma", 2.0)) if morph_cfg is not None else 2.0
     mtl_cfg = getattr(phase_cfg, "mtl", None)
     mtl_grad_strategy = str(getattr(mtl_cfg, "grad_strategy", "none")) if mtl_cfg is not None else "none"
     q_cfg = getattr(phase_cfg, "q", None)
@@ -1267,11 +1298,20 @@ def main():
         label = "ImageNet" if init_ckpt_imagenet else "stage"
         _load_pretrain_encoder_weights(model, Path(init_ckpt_pretrain), logger, label=label)
 
+    use_cosine_warmup = bool(getattr(phase_cfg, "use_cosine_warmup", False))
+    warmup_epochs = int(getattr(phase_cfg, "warmup_epochs", 5))
+    min_lr = float(getattr(phase_cfg, "min_lr", 0.0))
+    ema_decay = float(getattr(phase_cfg, "ema_decay", 0.0))
+
     lightning_module = MultiTaskLightningModule(
         model=model,
         phase=phase,
         lr=phase_cfg.lr,
         weight_decay=phase_cfg.weight_decay,
+        use_cosine_warmup=use_cosine_warmup,
+        warmup_epochs=warmup_epochs,
+        min_lr=min_lr,
+        ema_decay=ema_decay,
         loss_weights=loss_weights,
         freeze_config=freeze_cfg,
         morph_loss_reduction=phase_cfg.morph_loss_reduction,
@@ -1279,12 +1319,20 @@ def main():
         single_task_head=morph_single_head,
         mtl_grad_strategy=mtl_grad_strategy,
         exp_num_classes=morph_exp_max,
+        morph_lambda_icm=morph_lambda_icm,
+        morph_lambda_te=morph_lambda_te,
         quality_pos_weight=quality_pos_weight,
         use_class_weights=morph_use_class_weights,
         class_weight_mode=morph_class_weight_mode,
+        morph_class_weights_exp=morph_class_weights_exp,
+        morph_class_weights_icm=morph_class_weights_icm,
+        morph_class_weights_te=morph_class_weights_te,
         q_loss=q_loss,
         q_aux_alpha=q_aux_alpha,
         q_freeze_backbone=q_freeze_backbone,
+        use_focal_icm=morph_use_focal_icm,
+        use_focal_te=morph_use_focal_te,
+        focal_gamma=morph_focal_gamma,
         live_epoch_line=args.live_epoch_line,
     )
 
@@ -1306,6 +1354,10 @@ def main():
                 phase=phase,
                 lr=phase_cfg.lr,
                 weight_decay=phase_cfg.weight_decay,
+                use_cosine_warmup=use_cosine_warmup,
+                warmup_epochs=warmup_epochs,
+                min_lr=min_lr,
+                ema_decay=ema_decay,
                 loss_weights=loss_weights,
                 freeze_config=freeze_cfg,
                 morph_loss_reduction=phase_cfg.morph_loss_reduction,
@@ -1313,12 +1365,20 @@ def main():
                 single_task_head=morph_single_head,
                 mtl_grad_strategy=mtl_grad_strategy,
                 exp_num_classes=morph_exp_max,
+                morph_lambda_icm=morph_lambda_icm,
+                morph_lambda_te=morph_lambda_te,
                 quality_pos_weight=quality_pos_weight,
                 use_class_weights=morph_use_class_weights,
                 class_weight_mode=morph_class_weight_mode,
+                morph_class_weights_exp=morph_class_weights_exp,
+                morph_class_weights_icm=morph_class_weights_icm,
+                morph_class_weights_te=morph_class_weights_te,
                 q_loss=q_loss,
                 q_aux_alpha=q_aux_alpha,
                 q_freeze_backbone=q_freeze_backbone,
+                use_focal_icm=morph_use_focal_icm,
+                use_focal_te=morph_use_focal_te,
+                focal_gamma=morph_focal_gamma,
                 strict=True,
             )
         except RuntimeError as exc:
@@ -1506,6 +1566,10 @@ def main():
                 phase=phase,
                 lr=stage2_lr,
                 weight_decay=phase_cfg.weight_decay,
+                use_cosine_warmup=use_cosine_warmup,
+                warmup_epochs=warmup_epochs,
+                min_lr=min_lr,
+                ema_decay=ema_decay,
                 loss_weights=loss_weights,
                 freeze_config=freeze_cfg,
                 morph_loss_reduction=phase_cfg.morph_loss_reduction,
@@ -1513,12 +1577,20 @@ def main():
                 single_task_head=morph_single_head,
                 mtl_grad_strategy=mtl_grad_strategy,
                 exp_num_classes=morph_exp_max,
+                morph_lambda_icm=morph_lambda_icm,
+                morph_lambda_te=morph_lambda_te,
                 quality_pos_weight=quality_pos_weight,
                 use_class_weights=morph_use_class_weights,
                 class_weight_mode=morph_class_weight_mode,
+                morph_class_weights_exp=morph_class_weights_exp,
+                morph_class_weights_icm=morph_class_weights_icm,
+                morph_class_weights_te=morph_class_weights_te,
                 q_loss=q_loss,
                 q_aux_alpha=q_aux_alpha,
                 q_freeze_backbone=q_freeze_backbone,
+                use_focal_icm=morph_use_focal_icm,
+                use_focal_te=morph_use_focal_te,
+                focal_gamma=morph_focal_gamma,
             )
             trainer = _build_trainer(stage2_epochs)
             trainer.fit(lightning_module, datamodule=datamodule)
@@ -1551,6 +1623,10 @@ def main():
             phase=phase,
             lr=phase_cfg.lr,
             weight_decay=phase_cfg.weight_decay,
+            use_cosine_warmup=use_cosine_warmup,
+            warmup_epochs=warmup_epochs,
+            min_lr=min_lr,
+            ema_decay=ema_decay,
             loss_weights=loss_weights,
             freeze_config=freeze_cfg,
             morph_loss_reduction=phase_cfg.morph_loss_reduction,
@@ -1558,12 +1634,20 @@ def main():
             single_task_head=morph_single_head,
             mtl_grad_strategy=mtl_grad_strategy,
             exp_num_classes=morph_exp_max,
+            morph_lambda_icm=morph_lambda_icm,
+            morph_lambda_te=morph_lambda_te,
             quality_pos_weight=quality_pos_weight,
             use_class_weights=morph_use_class_weights,
             class_weight_mode=morph_class_weight_mode,
+            morph_class_weights_exp=morph_class_weights_exp,
+            morph_class_weights_icm=morph_class_weights_icm,
+            morph_class_weights_te=morph_class_weights_te,
             q_loss=q_loss,
             q_aux_alpha=q_aux_alpha,
             q_freeze_backbone=q_freeze_backbone,
+            use_focal_icm=morph_use_focal_icm,
+            use_focal_te=morph_use_focal_te,
+            focal_gamma=morph_focal_gamma,
         )
         _tune_quality_threshold(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
         _run_quality_test_eval(eval_module.model, datamodule.test_dataloader(), reports_dir, eval_device, logger)
@@ -1584,6 +1668,10 @@ def main():
             phase=phase,
             lr=phase_cfg.lr,
             weight_decay=phase_cfg.weight_decay,
+            use_cosine_warmup=use_cosine_warmup,
+            warmup_epochs=warmup_epochs,
+            min_lr=min_lr,
+            ema_decay=ema_decay,
             loss_weights=loss_weights,
             freeze_config=freeze_cfg,
             morph_loss_reduction=phase_cfg.morph_loss_reduction,
@@ -1591,12 +1679,20 @@ def main():
             single_task_head=morph_single_head,
             mtl_grad_strategy=mtl_grad_strategy,
             exp_num_classes=morph_exp_max,
+            morph_lambda_icm=morph_lambda_icm,
+            morph_lambda_te=morph_lambda_te,
             quality_pos_weight=quality_pos_weight,
             use_class_weights=morph_use_class_weights,
             class_weight_mode=morph_class_weight_mode,
+            morph_class_weights_exp=morph_class_weights_exp,
+            morph_class_weights_icm=morph_class_weights_icm,
+            morph_class_weights_te=morph_class_weights_te,
             q_loss=q_loss,
             q_aux_alpha=q_aux_alpha,
             q_freeze_backbone=q_freeze_backbone,
+            use_focal_icm=morph_use_focal_icm,
+            use_focal_te=morph_use_focal_te,
+            focal_gamma=morph_focal_gamma,
         )
         _tune_q_thresholds(eval_module.model, datamodule.val_dataloader(), eval_device, reports_dir, logger)
     else:

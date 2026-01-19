@@ -7,8 +7,8 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
-from ivf.models.encoder import ConvNeXtMini
 from ivf.models.heads import MorphologyHeads
+from ivf.models.morph_backbone import MorphologyBackbone
 
 
 class JointMorphNet(nn.Module):
@@ -22,7 +22,9 @@ class JointMorphNet(nn.Module):
         head_hidden_dim: int = 0,
     ) -> None:
         super().__init__()
-        self.encoder = encoder if encoder is not None else ConvNeXtMini(feature_dim=feature_dim)
+        self.encoder = encoder if encoder is not None else MorphologyBackbone(feature_dim=feature_dim)
+        if hasattr(self.encoder, "feature_dim"):
+            feature_dim = int(getattr(self.encoder, "feature_dim"))
         self.morph = MorphologyHeads(
             feature_dim,
             hidden_dim=head_hidden_dim,

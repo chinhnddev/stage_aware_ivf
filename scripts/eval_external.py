@@ -30,8 +30,8 @@ from ivf.data.label_schema import (
     q_proxy_from_components,
 )
 from ivf.eval import _normalize_day, build_quality_dataset_from_df, compute_metrics, predict, slice_by_day
-from ivf.models.encoder import ConvNeXtMini
 from ivf.models.multitask import MultiTaskEmbryoNet
+from ivf.models.morph_backbone import MorphologyBackbone
 from ivf.utils.guardrails import assert_no_hungvuong_training
 from ivf.utils.logging import configure_logging
 from ivf.utils.paths import ensure_outputs_dir
@@ -93,11 +93,13 @@ def parse_args():
 def build_model(cfg) -> MultiTaskEmbryoNet:
     model_cfg = cfg.model
     encoder_cfg = model_cfg.encoder
-    encoder = ConvNeXtMini(
+    encoder = MorphologyBackbone(
         in_channels=encoder_cfg.in_channels,
         dims=encoder_cfg.dims,
         feature_dim=encoder_cfg.feature_dim,
-        weights_path=encoder_cfg.weights_path,
+        fusion_mode=str(getattr(model_cfg, "fusion_mode", "concat")),
+        attention_type=str(getattr(model_cfg, "attention_type", "eca")),
+        attention_kernel=int(getattr(model_cfg, "attention_kernel", 3)),
     )
     return MultiTaskEmbryoNet(
         encoder=encoder,
