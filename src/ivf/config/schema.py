@@ -23,6 +23,8 @@ class HeadsConfig:
 @dataclass
 class ModelConfig:
     name: str = "multitask"
+    width_mult: float = 1.0
+    depth_mult: float = 1.0
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     heads: HeadsConfig = field(default_factory=HeadsConfig)
     encoder_config: Optional[str] = None
@@ -73,6 +75,11 @@ class MorphTrainingConfig:
     mode: str = "multi_task"
     single_task_head: str = "exp"
     exp_max: int = 6
+    finetune_stage1_epochs: int = 5
+    finetune_stage2_epochs: int = 15
+    finetune_stage1_lr: float = 1e-4
+    finetune_stage2_lr: float = 1e-5
+    finetune_unfreeze_last_blocks: int = 1
 
 
 @dataclass
@@ -98,6 +105,8 @@ class LossConfig:
 class TrainingConfig:
     lr: float = 0.001
     weight_decay: float = 0.0001
+    init_ckpt_imagenet: Optional[str] = None
+    init_ckpt_stage: Optional[str] = None
     epochs: Dict[str, int] = field(default_factory=lambda: {"morph": 20, "stage": 15, "joint": 10, "quality": 10, "q": 10, "baseline": 10})
     loss_weights: Dict[str, float] = field(default_factory=lambda: {"morph": 1.0, "stage": 1.0, "quality": 1.0, "q": 1.0})
     morph_loss_reduction: str = "mean"

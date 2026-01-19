@@ -51,10 +51,20 @@ class ConvNeXtMini(nn.Module):
         in_channels: int = 3,
         dims: Iterable[int] = (32, 64, 128),
         feature_dim: int = 256,
+        width_mult: float = 1.0,
+        depth_mult: float = 1.0,
+        blocks_per_stage: int = 2,
+        scale_feature_dim: bool = True,
         weights_path: Optional[str] = None,
     ) -> None:
         super().__init__()
-        dims = list(dims)
+        width_mult = float(width_mult)
+        depth_mult = float(depth_mult)
+        dims = [max(8, int(round(d * width_mult))) for d in list(dims)]
+        if scale_feature_dim:
+            feature_dim = max(8, int(round(feature_dim * width_mult)))
+        self.feature_dim = feature_dim
+        stage_blocks = max(1, int(round(blocks_per_stage * depth_mult)))
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, dims[0], kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(dims[0]),
@@ -66,7 +76,8 @@ class ConvNeXtMini(nn.Module):
         for out_dim in dims:
             stride = 2 if out_dim != in_dim else 1
             blocks.append(ConvBlock(in_dim, out_dim, stride=stride))
-            blocks.append(ConvBlock(out_dim, out_dim, stride=1))
+            for _ in range(stage_blocks - 1):
+                blocks.append(ConvBlock(out_dim, out_dim, stride=1))
             in_dim = out_dim
         self.blocks = nn.Sequential(*blocks)
         self.pool = nn.AdaptiveAvgPool2d(1)

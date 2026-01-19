@@ -111,6 +111,62 @@ def _safe_load_checkpoint(lightning_module, ckpt_path: Path, logger) -> None:
         )
 
 
+def _load_pretrain_encoder_weights(model, ckpt_path: Path, logger, label: str) -> None:
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"ImageNet checkpoint not found: {ckpt_path}")
+    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        raise ValueError("Model has no encoder to load ImageNet weights.")
+    if "encoder_state_dict" in checkpoint:
+        state = checkpoint["encoder_state_dict"]
+    else:
+        state = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint))
+        state = {
+            key.replace("model.encoder.", "").replace("encoder.", ""): value
+            for key, value in state.items()
+            if key.startswith("encoder.") or key.startswith("model.encoder.")
+        }
+    missing, unexpected = encoder.load_state_dict(state, strict=False)
+    if missing:
+        logger.warning("ImageNet encoder load missing keys: %s", missing[:5])
+    if unexpected:
+        logger.warning("ImageNet encoder load unexpected keys: %s", unexpected[:5])
+    logger.info("Loaded %s encoder weights from %s", label, ckpt_path)
+
+
+def _freeze_encoder_except_last_blocks(model, unfreeze_blocks: int, logger) -> None:
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        logger.warning("No encoder found; freeze skipped.")
+        return
+    for p in encoder.parameters():
+        p.requires_grad = False
+    blocks = getattr(encoder, "blocks", None)
+    if blocks is None:
+        logger.warning("Encoder blocks not found; unfreezing encoder.proj only.")
+    else:
+        unfreeze_blocks = max(0, int(unfreeze_blocks))
+        if unfreeze_blocks > 0:
+            for block in list(blocks)[-unfreeze_blocks:]:
+                for p in block.parameters():
+                    p.requires_grad = True
+    if hasattr(encoder, "proj"):
+        for p in encoder.proj.parameters():
+            p.requires_grad = True
+    logger.info("Stage1 finetune: unfreeze_last_blocks=%s", unfreeze_blocks)
+
+
+def _unfreeze_encoder(model, logger) -> None:
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        logger.warning("No encoder found; unfreeze skipped.")
+        return
+    for p in encoder.parameters():
+        p.requires_grad = True
+    logger.info("Stage2 finetune: encoder fully unfrozen.")
+
+
 def _summarize_morph_counts(dataset):
     counts = {
         "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
@@ -1097,6 +1153,9 @@ def main():
         cfg.model.heads.quality_conditioning = "none"
 
     model = build_model(cfg, phase=phase)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Model params: total=%s trainable=%s", total_params, trainable_params)
     logger.info("Quality conditioning mode: %s", getattr(model, "quality_conditioning", "n/a"))
     phase_cfg = cfg.training
     loss_weights = resolve_config_dict(phase_cfg.loss_weights)
@@ -1199,6 +1258,15 @@ def main():
             elif counts.get(1, 0) == 0:
                 logger.warning("Quality %s split has zero positive samples.", split_name)
 
+    init_ckpt_imagenet = getattr(phase_cfg, "init_ckpt_imagenet", None)
+    init_ckpt_stage = getattr(phase_cfg, "init_ckpt_stage", None)
+    if phase == "morph" and init_ckpt_imagenet and init_ckpt_stage:
+        raise ValueError("Specify only one of training.init_ckpt_imagenet or training.init_ckpt_stage.")
+    init_ckpt_pretrain = init_ckpt_imagenet or init_ckpt_stage
+    if phase == "morph" and init_ckpt_pretrain:
+        label = "ImageNet" if init_ckpt_imagenet else "stage"
+        _load_pretrain_encoder_weights(model, Path(init_ckpt_pretrain), logger, label=label)
+
     lightning_module = MultiTaskLightningModule(
         model=model,
         phase=phase,
@@ -1227,6 +1295,8 @@ def main():
                 f"Missing previous checkpoint for phase={phase}. "
                 "Run the earlier phase first or pass --allow_missing_ckpt to continue without loading."
             )
+    if phase == "morph" and init_ckpt_pretrain:
+        prev_ckpt = None
     if prev_ckpt is not None and prev_ckpt.exists():
         logger.info("Loading checkpoint weights from %s", prev_ckpt)
         try:
@@ -1386,21 +1456,75 @@ def main():
                 fallback_mode="min",
             )
         )
-    trainer = pl.Trainer(
-        max_epochs=max_epochs,
-        max_steps=max_steps,
-        enable_checkpointing=False,
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=log_every_n_steps,
-        logger=loggers if loggers else False,
-        deterministic=True,
-        accelerator=accelerator,
-        devices=devices,
-        default_root_dir=str(logs_dir),
-        callbacks=callbacks,
-    )
+    def _build_trainer(max_epochs_override: int):
+        return pl.Trainer(
+            max_epochs=max_epochs_override,
+            max_steps=max_steps,
+            enable_checkpointing=False,
+            enable_progress_bar=enable_progress_bar,
+            log_every_n_steps=log_every_n_steps,
+            logger=loggers if loggers else False,
+            deterministic=True,
+            accelerator=accelerator,
+            devices=devices,
+            default_root_dir=str(logs_dir),
+            callbacks=callbacks,
+        )
 
-    trainer.fit(lightning_module, datamodule=datamodule)
+    if phase == "morph" and init_ckpt_pretrain:
+        stage1_epochs = int(getattr(morph_cfg, "finetune_stage1_epochs", 5))
+        stage2_epochs = int(getattr(morph_cfg, "finetune_stage2_epochs", max(0, max_epochs - stage1_epochs)))
+        stage1_lr = float(getattr(morph_cfg, "finetune_stage1_lr", 1e-4))
+        stage2_lr = float(getattr(morph_cfg, "finetune_stage2_lr", 1e-5))
+        unfreeze_blocks = int(getattr(morph_cfg, "finetune_unfreeze_last_blocks", 1))
+
+        if stage1_epochs <= 0 and stage2_epochs <= 0:
+            raise ValueError("finetune_stage1_epochs and finetune_stage2_epochs must be > 0.")
+
+        logger.info(
+            "ImageNet finetune stages: stage1_epochs=%s lr=%.6f stage2_epochs=%s lr=%.6f unfreeze_last_blocks=%s",
+            stage1_epochs,
+            stage1_lr,
+            stage2_epochs,
+            stage2_lr,
+            unfreeze_blocks,
+        )
+
+        lightning_module.lr = stage1_lr
+        _freeze_encoder_except_last_blocks(lightning_module.model, unfreeze_blocks, logger)
+        trainer = _build_trainer(stage1_epochs)
+        trainer.fit(lightning_module, datamodule=datamodule)
+        stage1_ckpt = checkpoints_dir / "phase1_morph_stage1.ckpt"
+        trainer.save_checkpoint(stage1_ckpt)
+        logger.info("Saved stage1 checkpoint: %s", stage1_ckpt)
+
+        if stage2_epochs > 0:
+            _unfreeze_encoder(lightning_module.model, logger)
+            lightning_module = MultiTaskLightningModule.load_from_checkpoint(
+                checkpoint_path=str(stage1_ckpt),
+                model=lightning_module.model,
+                phase=phase,
+                lr=stage2_lr,
+                weight_decay=phase_cfg.weight_decay,
+                loss_weights=loss_weights,
+                freeze_config=freeze_cfg,
+                morph_loss_reduction=phase_cfg.morph_loss_reduction,
+                morph_mode=morph_mode,
+                single_task_head=morph_single_head,
+                mtl_grad_strategy=mtl_grad_strategy,
+                exp_num_classes=morph_exp_max,
+                quality_pos_weight=quality_pos_weight,
+                use_class_weights=morph_use_class_weights,
+                class_weight_mode=morph_class_weight_mode,
+                q_loss=q_loss,
+                q_aux_alpha=q_aux_alpha,
+                q_freeze_backbone=q_freeze_backbone,
+            )
+            trainer = _build_trainer(stage2_epochs)
+            trainer.fit(lightning_module, datamodule=datamodule)
+    else:
+        trainer = _build_trainer(max_epochs)
+        trainer.fit(lightning_module, datamodule=datamodule)
 
     ckpt_name = {
         "morph": "phase1_morph.ckpt",

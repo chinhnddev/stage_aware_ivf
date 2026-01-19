@@ -16,6 +16,8 @@ def build_model_from_config(cfg, phase: Optional[str] = None):
         in_channels=encoder_cfg.in_channels,
         dims=encoder_cfg.dims,
         feature_dim=encoder_cfg.feature_dim,
+        width_mult=float(getattr(model_cfg, "width_mult", 1.0)),
+        depth_mult=float(getattr(model_cfg, "depth_mult", 1.0)),
         weights_path=encoder_cfg.weights_path,
     )
 
@@ -27,7 +29,7 @@ def build_model_from_config(cfg, phase: Optional[str] = None):
         exp_max = int(getattr(morph_cfg, "exp_max", 6)) if morph_cfg is not None else 6
         return JointMorphNet(
             encoder=encoder,
-            feature_dim=encoder_cfg.feature_dim,
+            feature_dim=encoder.feature_dim,
             exp_num_classes=exp_max,
             icm_num_classes=3,
             te_num_classes=3,
@@ -35,7 +37,7 @@ def build_model_from_config(cfg, phase: Optional[str] = None):
 
     return MultiTaskEmbryoNet(
         encoder=encoder,
-        feature_dim=encoder_cfg.feature_dim,
+        feature_dim=encoder.feature_dim,
         quality_mode=model_cfg.heads.quality_mode,
         quality_conditioning=getattr(model_cfg.heads, "quality_conditioning", "morph+stage"),
     )

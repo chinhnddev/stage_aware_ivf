@@ -1,0 +1,26 @@
+device: cuda
+
+model:
+  dims: [32, 64, 128]
+  feature_dim: 256
+  width_mult: 4.0
+  depth_mult: 3.0
+
+data:
+  root_dir: /path/to/imagenet
+  train_dir: /path/to/imagenet/train
+  val_dir: /path/to/imagenet/val
+
+training:
+  image_size: 224
+  batch_size: 256
+  epochs: 90
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 5
+  num_workers: 8
+  label_smoothing: 0.1
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.0
+  ema_decay: 0.9999
+  randaugment: true
