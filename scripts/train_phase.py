@@ -63,6 +63,7 @@ def parse_args():
     parser.add_argument("--live_epoch_line", action="store_true", help="Show live epoch progress on a single line.")
     parser.add_argument("--allow_missing_ckpt", action="store_true", help="Allow missing previous checkpoint for later phases.")
     parser.add_argument("--dry_run", action="store_true", help="Validate pipeline without training.")
+    parser.add_argument("--overrides", nargs="*", default=None, help="Optional OmegaConf dotlist overrides.")
     return parser.parse_args()
 
 
@@ -1072,6 +1073,8 @@ def main():
     args = parse_args()
     phase = args.phase
     cfg = load_experiment_config(args.config)
+    if args.overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.overrides))
     if args.seed is not None:
         cfg.seed = args.seed
     if args.num_workers is not None:
