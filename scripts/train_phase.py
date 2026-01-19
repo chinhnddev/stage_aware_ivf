@@ -175,13 +175,20 @@ def _normalize_split_paths(df: pd.DataFrame, root_dir: Optional[str]) -> pd.Data
 
 
 def _resolve_blastocyst_group_col(df: pd.DataFrame, split_cfg: dict) -> Optional[str]:
+    allow_missing = bool(split_cfg.get("allow_missing_group_col", False))
     group_col = split_cfg.get("group_col")
     if not group_col:
+        if allow_missing:
+            return None
         raise ValueError("Blastocyst split.group_col is required for leakage-safe grouping.")
     if group_col not in df.columns:
+        if allow_missing:
+            return None
         raise ValueError(f"Blastocyst split.group_col '{group_col}' missing from metadata.")
     missing_frac = float(df[group_col].isna().mean())
     if missing_frac > MISSINGNESS_THRESHOLD:
+        if allow_missing:
+            return None
         raise ValueError(
             f"Blastocyst split.group_col '{group_col}' missingness {missing_frac:.1%} exceeds threshold {MISSINGNESS_THRESHOLD:.1%}."
         )
@@ -447,8 +454,10 @@ def _ensure_blastocyst_splits(blast_cfg, split_entry, seed: int, logger):
     split_seed = int(split_cfg.get("seed", seed))
     stratified = bool(split_cfg.get("stratified", False))
     min_val_per_class = int(split_cfg.get("min_val_per_class", 3))
+    use_gold_test = bool(split_cfg.get("use_gold_test", False))
+    regen_missing_test = bool(split_cfg.get("regenerate_if_missing_test", False))
     required = ["train", "val"]
-    if test_ratio > 0:
+    if test_ratio > 0 or use_gold_test:
         required.append("test")
 
     if isinstance(split_entry, dict):
@@ -471,10 +480,13 @@ def _ensure_blastocyst_splits(blast_cfg, split_entry, seed: int, logger):
         return split_dir
     if any(existing[name] for name in required):
         missing = [name for name in required if not existing[name]]
-        raise FileNotFoundError(
-            f"Blastocyst split files missing ({missing}) in {split_dir}; "
-            "remove existing files to regenerate a full set."
-        )
+        if regen_missing_test and missing == ["test"]:
+            logger.warning("Blastocyst test split missing; regenerating full splits at %s.", split_dir)
+        else:
+            raise FileNotFoundError(
+                f"Blastocyst split files missing ({missing}) in {split_dir}; "
+                "remove existing files to regenerate a full set."
+            )
 
     logger.info("Generating blastocyst splits at %s", split_dir)
     day_col = blast_cfg.get("day_col") if blast_cfg.get("include_meta_day", True) else None
@@ -492,6 +504,17 @@ def _ensure_blastocyst_splits(blast_cfg, split_entry, seed: int, logger):
     df = records_to_dataframe(records)
     df = _normalize_split_paths(df, blast_cfg.get("root_dir"))
     group_col = _resolve_blastocyst_group_col(df, split_cfg)
+    test_df = None
+    if use_gold_test and "split" in df.columns:
+        mask = df["split"].astype(str).str.lower() == "test"
+        if mask.any():
+            test_df = df[mask].copy()
+            df = df[~mask].copy()
+            logger.info("Using gold test split from metadata (rows=%s).", len(test_df))
+        else:
+            logger.warning("split.use_gold_test set but no test rows found; falling back to random split.")
+
+    split_test_ratio = 0.0 if test_df is not None else test_ratio
     splits = None
     if stratified:
         logger.info("Using stratified blastocyst split (min_val_per_class=%s).", min_val_per_class)
@@ -500,7 +523,7 @@ def _ensure_blastocyst_splits(blast_cfg, split_entry, seed: int, logger):
                 df,
                 group_col=group_col,
                 val_ratio=val_ratio,
-                test_ratio=test_ratio,
+                test_ratio=split_test_ratio,
                 seed=split_seed,
                 min_val_per_class=min_val_per_class,
                 logger=logger,
@@ -516,9 +539,11 @@ def _ensure_blastocyst_splits(blast_cfg, split_entry, seed: int, logger):
             df,
             group_col=group_col,
             val_ratio=val_ratio,
-            test_ratio=test_ratio,
+            test_ratio=split_test_ratio,
             seed=split_seed,
         )
+    if test_df is not None:
+        splits["test"] = test_df
     save_splits(splits, output_dir=split_dir)
     logger.info("Saved blastocyst splits to %s", split_dir)
     return split_dir
@@ -1077,6 +1102,7 @@ def main():
         loss_weights.setdefault("morph", 1.0)
         loss_weights["stage"] = 0.0
         loss_weights["quality"] = 0.0
+        loss_weights["q"] = 0.0
         logger.info("Morph phase loss weights: %s", loss_weights)
     freeze_cfg = resolve_config_dict(phase_cfg.freeze)
     morph_cfg = getattr(phase_cfg, "morph", None)
