@@ -1040,17 +1040,8 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.icm_class_counts = counts["icm"].clone()
         self.te_class_counts = counts["te"].clone()
 
-        self.icm_num_classes = 2 if counts["icm"][2] == 0 else 3
-        self.te_num_classes = 2 if counts["te"][2] == 0 else 3
-        if self.icm_num_classes == 2:
-            logger.warning("ICM class C missing; using 2-class (A/B) loss and metrics.")
-        if self.te_num_classes == 2:
-            logger.warning("TE class C missing; using 2-class (A/B) loss and metrics.")
-        logger.info(
-            "Morph heads for loss/metrics: icm_num_classes=%s te_num_classes=%s.",
-            self.icm_num_classes,
-            self.te_num_classes,
-        )
+        self.icm_num_classes = len(ICM_CLASSES)
+        self.te_num_classes = len(TE_CLASSES)
 
         def _imbalance_ratio(head_counts: torch.Tensor, num_classes: int) -> Optional[float]:
             if num_classes <= 0:

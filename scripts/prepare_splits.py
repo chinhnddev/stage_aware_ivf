@@ -80,6 +80,13 @@ def _normalize_split_paths(df: pd.DataFrame, root_dir: str) -> pd.DataFrame:
     return df
 
 
+def _ensure_id_col(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    id_col = cfg.get("id_col")
+    if id_col and id_col not in df.columns and "id" in df.columns:
+        return df.rename(columns={"id": id_col})
+    return df
+
+
 def make_blastocyst_splits(cfg: dict):
     day_col = cfg.get("day_col") if cfg.get("include_meta_day", True) else None
     records, stats = load_blastocyst_records(
@@ -104,6 +111,7 @@ def make_blastocyst_splits(cfg: dict):
         print(f"  - invalid_exp: {stats.invalid_exp}")
     df = records_to_dataframe(records)
     df = _normalize_split_paths(df, cfg["root_dir"])
+    df = _ensure_id_col(df, cfg)
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
@@ -128,6 +136,7 @@ def make_humanembryo2_splits(cfg: dict):
     )
     df = humanembryo2_records_to_dataframe(records)
     df = _normalize_split_paths(df, cfg["root_dir"])
+    df = _ensure_id_col(df, cfg)
     split_cfg = cfg.get("split", {})
     splits = split_by_group(
         df,
@@ -146,6 +155,7 @@ def make_quality_public_splits(cfg: dict):
     df = df.copy()
     df["image_path"] = df[cfg["image_col"]].apply(lambda x: str(Path(cfg["root_dir"]) / str(x)))
     df = _normalize_split_paths(df, cfg["root_dir"])
+    df = _ensure_id_col(df, cfg)
     df["quality"] = df[cfg["label_col"]].apply(map_gardner_to_quality).apply(lambda x: x.value if x else None)
     unknown_count = int(df["quality"].isna().sum())
     if unknown_count:

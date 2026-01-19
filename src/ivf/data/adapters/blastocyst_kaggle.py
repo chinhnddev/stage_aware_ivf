@@ -14,7 +14,6 @@ from ivf.data.label_schema import (
     UNSET,
     gardner_to_morphology_targets,
     is_gardner_range_label,
-    map_gardner_to_quality,
     normalize_gardner_exp,
     normalize_gardner_grade,
     parse_gardner_components,
@@ -143,7 +142,6 @@ def load_blastocyst_records(
             stats.invalid_exp += 1
             continue  # skip unknown/invalid grades
 
-        quality = map_gardner_to_quality(grade)
         icm_meta = normalize_gardner_grade(icm_raw) if icm_col else (components[1] if components else None)
         te_meta = normalize_gardner_grade(te_raw) if te_col else (components[2] if components else None)
         if exp < 3:
@@ -157,8 +155,6 @@ def load_blastocyst_records(
             "icm": icm_meta,
             "te": te_meta,
         }
-        if quality:
-            meta["quality"] = quality.value
         if day_col and day_col in df.columns and pd.notna(row.get(day_col)):
             meta["day"] = row.get(day_col)
 

@@ -237,12 +237,11 @@ def _log_morphology_train_stats(records: list, context: str) -> None:
     for head in ("icm", "te"):
         if not unique_targets[head]:
             continue
-        expected_num_classes = 3 if meta_counts[head].get("C", 0) > 0 else 2
         max_label = max(unique_targets[head])
-        if max_label >= expected_num_classes:
+        if max_label >= len(ICM_CLASSES):
             raise ValueError(
                 f"Morph {context} {head} targets out of range: {sorted(unique_targets[head])} "
-                f"with num_classes={expected_num_classes}. Check label encoding (e.g., B encoded as 2)."
+                f"with num_classes={len(ICM_CLASSES)}. Check label encoding (e.g., C encoded as 2)."
             )
 
 
