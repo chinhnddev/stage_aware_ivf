@@ -970,7 +970,13 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         if self._val_pred_counts and self.phase in {"morph", "joint"}:
             logger = get_logger("ivf")
-            for head, classes in (("icm", ICM_CLASSES[: self.icm_num_classes]), ("te", TE_CLASSES[: self.te_num_classes])):
+            if self.morph_protocol == "paper":
+                icm_classes = ["A", "B", "C", "ND"][: self.icm_num_classes]
+                te_classes = ["A", "B", "C", "ND"][: self.te_num_classes]
+            else:
+                icm_classes = ICM_CLASSES[: self.icm_num_classes]
+                te_classes = TE_CLASSES[: self.te_num_classes]
+            for head, classes in (("icm", icm_classes), ("te", te_classes)):
                 if not self._is_head_active(head):
                     continue
                 counts = self._val_pred_counts.get(head)
