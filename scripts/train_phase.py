@@ -1449,6 +1449,7 @@ def main():
         morph_balance_icm_te=morph_balance_icm_te,
         morph_labeled_mix_ratio=morph_labeled_mix_ratio,
         morph_exp_max=morph_exp_max,
+        morph_protocol=getattr(morph_cfg, "protocol", "paper"),
         q_weights=q_weights,
     )
 

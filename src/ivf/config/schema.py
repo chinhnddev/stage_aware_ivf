@@ -92,6 +92,7 @@ class MorphTrainingConfig:
     finetune_stage1_lr: float = 1e-4
     finetune_stage2_lr: float = 1e-5
     finetune_unfreeze_last_blocks: int = 1
+    protocol: str = "paper"
 
 
 @dataclass

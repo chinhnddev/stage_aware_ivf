@@ -32,6 +32,9 @@ from ivf.data.label_schema import (
     parse_gardner_components,
     q_proxy_from_components,
 )
+
+PAPER_ICM_CLASSES = ["A", "B", "C", "ND"]
+PAPER_TE_CLASSES = ["A", "B", "C", "ND"]
 from ivf.data.transforms import assert_no_augmentation, get_eval_transforms, get_train_transforms
 from ivf.utils.logging import get_logger
 
@@ -161,6 +164,37 @@ def _is_silver_undefined(value) -> bool:
     except (TypeError, ValueError):
         return False
     return num == 3
+
+
+def _coerce_paper_exp(raw_value):
+    if raw_value is None or pd.isna(raw_value):
+        return None
+    try:
+        value = int(float(raw_value))
+    except (TypeError, ValueError):
+        return None
+    if 0 <= value <= 4:
+        return value
+    return None
+
+
+def _coerce_paper_icm_te(raw_value):
+    if raw_value is None or pd.isna(raw_value):
+        return None
+    try:
+        value = int(float(raw_value))
+    except (TypeError, ValueError):
+        return None
+    if 0 <= value <= 3:
+        return value
+    return None
+
+
+def _paper_label_name(idx: int, head: str) -> str:
+    classes = PAPER_ICM_CLASSES if head == "icm" else PAPER_TE_CLASSES
+    if 0 <= idx < len(classes):
+        return classes[idx]
+    return "ND"
 
 
 def _normalize_icm_te_label(raw_value, zero_based: bool) -> Optional[str]:
@@ -548,6 +582,99 @@ def _build_morphology_records(
     return records
 
 
+def _build_paper_morphology_records(
+    df: pd.DataFrame,
+    include_meta_day: bool,
+    context: str,
+) -> tuple[list, dict, pd.DataFrame]:
+    logger = get_logger("ivf")
+    records = []
+    counts = {
+        "exp_bin": {0: 0, 1: 0},
+        "icm": {cls: 0 for cls in PAPER_ICM_CLASSES},
+        "te": {cls: 0 for cls in PAPER_TE_CLASSES},
+    }
+    mapping_rows = []
+    stats = {"total": 0, "invalid_exp": 0, "invalid_icm": 0, "invalid_te": 0, "kept": 0}
+
+    for _, row in df.iterrows():
+        stats["total"] += 1
+        raw_exp = row.get("exp")
+        raw_icm = row.get("icm")
+        raw_te = row.get("te")
+        exp_raw_int = _coerce_paper_exp(raw_exp)
+        icm_raw_int = _coerce_paper_icm_te(raw_icm)
+        te_raw_int = _coerce_paper_icm_te(raw_te)
+        if exp_raw_int is None:
+            stats["invalid_exp"] += 1
+            continue
+        if icm_raw_int is None:
+            stats["invalid_icm"] += 1
+            continue
+        if te_raw_int is None:
+            stats["invalid_te"] += 1
+            continue
+
+        exp_bin = 1 if exp_raw_int >= 3 else 0
+        icm_label = _paper_label_name(icm_raw_int, "icm")
+        te_label = _paper_label_name(te_raw_int, "te")
+        counts["exp_bin"][exp_bin] += 1
+        counts["icm"][icm_label] += 1
+        counts["te"][te_label] += 1
+
+        if len(mapping_rows) < 50:
+            mapping_rows.append(
+                {
+                    "raw_exp": exp_raw_int,
+                    "exp_bin": exp_bin,
+                    "raw_icm": icm_raw_int,
+                    "icm_label": icm_label,
+                    "raw_te": te_raw_int,
+                    "te_label": te_label,
+                }
+            )
+
+        targets = make_full_target_dict(
+            exp=exp_bin,
+            icm=icm_raw_int,
+            te=te_raw_int,
+            exp_mask=1,
+            icm_mask=1,
+            te_mask=1,
+        )
+        meta = {
+            "id": row.get("id"),
+            "dataset": row.get("dataset", "blastocyst"),
+            "grade": row.get("grade"),
+            "exp_raw": exp_raw_int,
+            "exp_bin": exp_bin,
+            "icm": icm_label,
+            "te": te_label,
+        }
+        if include_meta_day and "day" in row:
+            meta["day"] = row.get("day")
+        records.append(
+            {
+                "image_path": row.get("image_path"),
+                "targets": targets,
+                "meta": meta,
+            }
+        )
+        stats["kept"] += 1
+
+    sample_df = pd.DataFrame(mapping_rows) if mapping_rows else pd.DataFrame()
+    logger.info("Morph %s paper stats: %s", context, stats)
+    if not sample_df.empty:
+        logger.info(
+            "Morph %s paper mapping (first %s rows):\n%s",
+            context,
+            len(sample_df),
+            sample_df.to_string(index=False),
+        )
+
+    return records, counts, sample_df
+
+
 def _build_q_records(
     df: pd.DataFrame,
     include_meta_day: bool,
@@ -777,6 +904,7 @@ class IVFDataModule(pl.LightningDataModule):
         morph_balance_icm_te: bool = False,
         morph_labeled_mix_ratio: float = 0.5,
         morph_exp_max: int = 6,
+        morph_protocol: str = "paper",
         q_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         super().__init__()
@@ -804,6 +932,7 @@ class IVFDataModule(pl.LightningDataModule):
         self.morph_balance_icm_te = morph_balance_icm_te
         self.morph_labeled_mix_ratio = morph_labeled_mix_ratio
         self.morph_exp_max = morph_exp_max
+        self.morph_protocol = morph_protocol
         self.q_weights = q_weights
         self.morph_labeled_idx = []
         self.morph_icm_counts = None
@@ -942,16 +1071,50 @@ class IVFDataModule(pl.LightningDataModule):
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["blastocyst"], ("patient_id", "embryo_id"))
             _assert_no_group_overlap_dfs(train_df, val_df, test_df, group_col, context="blastocyst")
-            morph_train_records = _build_morphology_records(
-                train_df,
-                self.include_meta_day,
-                context="morph_train",
-                drop_missing_icm_te=False,
-                exp_max=self.morph_exp_max,
-            )
+            protocol = (self.morph_protocol or "gardner").lower()
+            logger.info("Morph paper protocol=%s", protocol)
+            if protocol == "paper":
+                morph_train_records, train_counts, _ = _build_paper_morphology_records(
+                    train_df,
+                    self.include_meta_day,
+                    context="morph_train",
+                )
+                morph_val_records, val_counts, _ = _build_paper_morphology_records(
+                    val_df,
+                    self.include_meta_day,
+                    context="morph_val",
+                )
+                logger.info(
+                    "Morph paper train counts: exp_bin=%s icm=%s te=%s",
+                    train_counts["exp_bin"],
+                    train_counts["icm"],
+                    train_counts["te"],
+                )
+                logger.info(
+                    "Morph paper val counts: exp_bin=%s icm=%s te=%s",
+                    val_counts["exp_bin"],
+                    val_counts["icm"],
+                    val_counts["te"],
+                )
+            else:
+                morph_train_records = _build_morphology_records(
+                    train_df,
+                    self.include_meta_day,
+                    context="morph_train",
+                    drop_missing_icm_te=False,
+                    exp_max=self.morph_exp_max,
+                )
+                morph_val_records = _build_morphology_records(
+                    val_df,
+                    self.include_meta_day,
+                    context="morph_val",
+                    exp_max=self.morph_exp_max,
+                )
             labeled_idx = []
-            icm_counts = torch.zeros(len(ICM_CLASSES), dtype=torch.long)
-            te_counts = torch.zeros(len(TE_CLASSES), dtype=torch.long)
+            icm_classes = PAPER_ICM_CLASSES if protocol == "paper" else ICM_CLASSES
+            te_classes = PAPER_TE_CLASSES if protocol == "paper" else TE_CLASSES
+            icm_counts = torch.zeros(len(icm_classes), dtype=torch.long)
+            te_counts = torch.zeros(len(te_classes), dtype=torch.long)
             sample_info = []
             for idx, record in enumerate(morph_train_records):
                 targets = record.get("targets", {})
@@ -961,7 +1124,12 @@ class IVFDataModule(pl.LightningDataModule):
                 te_mask = targets.get("te_mask", 0)
                 icm_label = targets.get("icm", IGNORE_INDEX)
                 te_label = targets.get("te", IGNORE_INDEX)
-                if targets.get("exp_mask", 0) == 1 and exp_value is not None and exp_value >= 3:
+                include_any_exp = protocol == "paper"
+                if (
+                    targets.get("exp_mask", 0) == 1
+                    and exp_value is not None
+                    and (include_any_exp or exp_value >= 3)
+                ):
                     if icm_mask or te_mask:
                         labeled_idx.append(idx)
                 if icm_mask and icm_label is not None and icm_label >= 0 and icm_label < icm_counts.numel():
@@ -981,7 +1149,8 @@ class IVFDataModule(pl.LightningDataModule):
             self.morph_te_counts = te_counts
             self.morph_sample_info = sample_info
             logger.info("Morph labeled_idx size=%s", len(labeled_idx))
-            _log_morphology_train_stats(morph_train_records, context="morph_train")
+            if protocol != "paper":
+                _log_morphology_train_stats(morph_train_records, context="morph_train")
             self.train_dataset = BaseImageDataset(
                 morph_train_records,
                 transform=train_tf,
@@ -989,12 +1158,7 @@ class IVFDataModule(pl.LightningDataModule):
                 root_dir=self._root_dir("blastocyst"),
             )
             self.val_dataset = BaseImageDataset(
-                _build_morphology_records(
-                    val_df,
-                    self.include_meta_day,
-                    context="morph_val",
-                    exp_max=self.morph_exp_max,
-                ),
+                morph_val_records,
                 transform=eval_tf,
                 include_meta_day=self.include_meta_day,
                 root_dir=self._root_dir("blastocyst"),
