@@ -70,7 +70,19 @@ def _load_split_df(split_dir: Union[Path, Mapping[str, str]], split_name: str) -
         split_path = split_dir / f"{split_name}.csv"
     if not split_path.exists():
         raise FileNotFoundError(f"Missing split CSV: {split_path}")
-    return pd.read_csv(split_path)
+    df = pd.read_csv(split_path)
+    # Support paper-format split files (no header): "filename, exp, icm, te"
+    if df.shape[1] >= 4:
+        cols = [str(c).strip().lower() for c in df.columns.tolist()]
+        if any(c.endswith(".png") for c in cols):
+            # first row was treated as header; re-read without header
+            df = pd.read_csv(split_path, header=None)
+    if "filename" not in df.columns and "image_path" not in df.columns and df.shape[1] >= 4:
+        # likely paper-format without header
+        df = df.iloc[:, :4].copy()
+        df.columns = ["filename", "exp", "icm", "te"]
+        df["filename"] = df["filename"].astype(str).str.strip()
+    return df
 
 
 def _resolve_group_col(df: pd.DataFrame, split_entry, candidates) -> Optional[str]:
@@ -599,6 +611,10 @@ def _build_paper_morphology_records(
 
     for _, row in df.iterrows():
         stats["total"] += 1
+        filename = row.get("filename")
+        image_path = row.get("image_path")
+        if (image_path is None or (isinstance(image_path, float) and pd.isna(image_path))) and filename is not None:
+            image_path = f"Images/{str(filename).strip()}"
         raw_exp = row.get("exp")
         raw_icm = row.get("icm")
         raw_te = row.get("te")
@@ -645,7 +661,7 @@ def _build_paper_morphology_records(
             te_mask=1,
         )
         meta = {
-            "id": row.get("id"),
+            "id": row.get("id") if "id" in row else (str(filename).strip() if filename is not None else row.get("image_path")),
             "dataset": row.get("dataset", "blastocyst"),
             "grade": row.get("grade"),
             "exp_raw": exp_raw_int,
@@ -657,7 +673,7 @@ def _build_paper_morphology_records(
             meta["day"] = row.get("day")
         records.append(
             {
-                "image_path": row.get("image_path"),
+                "image_path": image_path,
                 "targets": targets,
                 "meta": meta,
             }
@@ -1068,8 +1084,11 @@ class IVFDataModule(pl.LightningDataModule):
             train_df = _load_split_df(self.splits["blastocyst"], "train")
             val_df = _load_split_df(self.splits["blastocyst"], "val")
             try:
-                test_df = _load_split_df(self.splits["blastocyst"], "test")
-            except FileNotFoundError:
+                test_key = "test"
+                if isinstance(self.splits.get("blastocyst"), Mapping) and "testset_filenames" in self.splits["blastocyst"]:
+                    test_key = "testset_filenames"
+                test_df = _load_split_df(self.splits["blastocyst"], test_key)
+            except (FileNotFoundError, KeyError):
                 test_df = None
             group_col = _resolve_group_col(train_df, self.splits["blastocyst"], ("patient_id", "embryo_id"))
             _assert_no_group_overlap_dfs(train_df, val_df, test_df, group_col, context="blastocyst")

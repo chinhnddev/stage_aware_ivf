@@ -701,18 +701,58 @@ def _morph_label_distribution(df: pd.DataFrame) -> dict:
 
 
 def _log_blastocyst_split_stats(split_entry, logger) -> None:
-    for split_name in ("train", "val", "test"):
+    def _read_flexible(path: Path) -> pd.DataFrame:
+        df = pd.read_csv(path)
+        # paper-format: no header, first row becomes header => empty df
+        if df.shape[1] >= 4:
+            cols = [str(c).strip().lower() for c in df.columns.tolist()]
+            if any(c.endswith(".png") for c in cols):
+                df = pd.read_csv(path, header=None)
+        if "filename" not in df.columns and "image_path" not in df.columns and df.shape[1] >= 4:
+            df = df.iloc[:, :4].copy()
+            df.columns = ["filename", "exp", "icm", "te"]
+            df["filename"] = df["filename"].astype(str).str.strip()
+        return df
+
+    def _paper_counts(df: pd.DataFrame) -> dict:
+        exp = pd.to_numeric(df.get("exp"), errors="coerce")
+        icm = pd.to_numeric(df.get("icm"), errors="coerce")
+        te = pd.to_numeric(df.get("te"), errors="coerce")
+        exp = exp.dropna().astype(int)
+        icm = icm.dropna().astype(int)
+        te = te.dropna().astype(int)
+        return {
+            "n_exp_labeled": int(exp.shape[0]),
+            "n_icm_labeled": int(icm.shape[0]),
+            "n_te_labeled": int(te.shape[0]),
+            "exp": {i: int((exp == i).sum()) for i in range(5)},
+            "icm": {i: int((icm == i).sum()) for i in range(4)},
+            "te": {i: int((te == i).sum()) for i in range(4)},
+        }
+
+    split_names = ["train", "val"]
+    if isinstance(split_entry, dict) and "testset_filenames" in split_entry:
+        split_names.append("testset_filenames")
+    else:
+        split_names.append("test")
+
+    for split_name in split_names:
+        # treat testset_filenames as the paper test split for logging
+        log_name = "test" if split_name == "testset_filenames" else split_name
         split_path = _resolve_split_path(split_entry, split_name)
         if not split_path.exists():
-            if split_name == "test":
+            if split_name in {"test", "testset_filenames"}:
                 logger.info("Blastocyst test split not found; skipping %s", split_path)
                 continue
             raise FileNotFoundError(f"Missing blastocyst split: {split_path}")
-        df = pd.read_csv(split_path)
-        counts = _morph_label_distribution(df)
+        df = _read_flexible(split_path)
+        if "filename" in df.columns and "image_path" not in df.columns:
+            counts = _paper_counts(df)
+        else:
+            counts = _morph_label_distribution(df)
         logger.info(
             "Blastocyst %s split path=%s rows=%s n_exp_labeled=%s n_icm_labeled=%s n_te_labeled=%s",
-            split_name,
+            log_name,
             split_path,
             len(df),
             counts["n_exp_labeled"],
@@ -721,7 +761,7 @@ def _log_blastocyst_split_stats(split_entry, logger) -> None:
         )
         logger.info(
             "Blastocyst %s label distribution exp=%s icm=%s te=%s",
-            split_name,
+            log_name,
             counts["exp"],
             counts["icm"],
             counts["te"],

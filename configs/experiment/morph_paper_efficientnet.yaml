@@ -3,6 +3,9 @@ base_config: configs/experiment/base.yaml
 model:
   name: morph_paper
 
+data:
+  blastocyst_config: configs/data/blastocyst_paper.yaml
+
 transforms:
   image_size: 224
   crop_size: 224

@@ -76,6 +76,11 @@ def _write_split(df: pd.DataFrame, output_dir: Path, name: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare constrained splits for blastocyst dataset.")
     parser.add_argument("--csv_path", default="data/metadata/blastocyst.csv", help="Metadata CSV path.")
+    parser.add_argument(
+        "--complete_csv",
+        default=None,
+        help="Optional paper-format complete.csv (no header, columns: filename, exp, icm, te). When set, --csv_path/--*_col are ignored.",
+    )
     parser.add_argument("--output_dir", default="data/processed/splits/blastocyst", help="Output directory.")
     parser.add_argument("--image_col", default="image_path", help="Image path column.")
     parser.add_argument("--exp_col", default="exp", help="EXP column (0..4).")
@@ -88,18 +93,52 @@ def main() -> None:
     parser.add_argument("--min_te_c", type=int, default=25, help="Minimum TE-C count in test.")
     args = parser.parse_args()
 
-    csv_path = Path(args.csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Missing CSV: {csv_path}")
+    if args.complete_csv:
+        complete_path = Path(args.complete_csv)
+        if not complete_path.exists():
+            raise FileNotFoundError(f"Missing complete.csv: {complete_path}")
+        df_raw = pd.read_csv(complete_path, header=None)
+        if df_raw.shape[1] < 4:
+            raise ValueError(f"complete.csv must have 4 columns: filename, exp, icm, te (got {df_raw.shape[1]}).")
+        df_raw = df_raw.iloc[:, :4].copy()
+        df_raw.columns = ["filename", "exp", "icm", "te"]
+        df_raw["filename"] = df_raw["filename"].astype(str).str.strip()
+        df_raw["__file"] = df_raw["filename"]
+        df_raw["__exp"] = df_raw["exp"].apply(_coerce_int)
+        df_raw["__icm"] = df_raw["icm"].apply(_coerce_int)
+        df_raw["__te"] = df_raw["te"].apply(_coerce_int)
+        stats = {
+            "total": int(len(df_raw)),
+            "missing_exp": int(df_raw["__exp"].isna().sum()),
+            "missing_icm": int(df_raw["__icm"].isna().sum()),
+            "missing_te": int(df_raw["__te"].isna().sum()),
+            "invalid_exp": int((~df_raw["__exp"].isna() & ~df_raw["__exp"].isin(range(5))).sum()),
+            "invalid_icm": int((~df_raw["__icm"].isna() & ~df_raw["__icm"].isin(range(4))).sum()),
+            "invalid_te": int((~df_raw["__te"].isna() & ~df_raw["__te"].isin(range(4))).sum()),
+        }
+        valid_mask = (
+            df_raw["__exp"].isin(range(5))
+            & df_raw["__icm"].isin(range(4))
+            & df_raw["__te"].isin(range(4))
+        )
+        df = df_raw.loc[valid_mask].copy()
+        df["__exp"] = df["__exp"].astype(int)
+        df["__icm"] = df["__icm"].astype(int)
+        df["__te"] = df["__te"].astype(int)
+        print(f"Loaded {stats['total']} rows from {complete_path}")
+    else:
+        csv_path = Path(args.csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Missing CSV: {csv_path}")
 
-    df_raw = pd.read_csv(csv_path)
-    for col in (args.image_col, args.exp_col, args.icm_col, args.te_col):
-        if col not in df_raw.columns:
-            raise ValueError(f"Missing column '{col}' in {csv_path}")
+        df_raw = pd.read_csv(csv_path)
+        for col in (args.image_col, args.exp_col, args.icm_col, args.te_col):
+            if col not in df_raw.columns:
+                raise ValueError(f"Missing column '{col}' in {csv_path}")
 
-    df_raw = _ensure_unique_filenames(df_raw, args.image_col)
-    df, stats = _validate_labels(df_raw, args.exp_col, args.icm_col, args.te_col)
-    print(f"Loaded {stats['total']} rows from {csv_path}")
+        df_raw = _ensure_unique_filenames(df_raw, args.image_col)
+        df, stats = _validate_labels(df_raw, args.exp_col, args.icm_col, args.te_col)
+        print(f"Loaded {stats['total']} rows from {csv_path}")
     print(
         "Label stats: missing_exp=%s missing_icm=%s missing_te=%s invalid_exp=%s invalid_icm=%s invalid_te=%s"
         % (
@@ -195,8 +234,16 @@ def main() -> None:
         random_state=args.seed,
     )
 
-    _write_split(train_df, output_dir, "train")
-    _write_split(val_df, output_dir, "val")
+    if args.complete_csv:
+        # Paper-style split CSVs (no header; 4 columns: filename, exp, icm, te)
+        for name, split_df in (("train", train_df), ("val", val_df)):
+            out_path = output_dir / f"{name}.csv"
+            with out_path.open("w", encoding="utf-8") as f:
+                for _, row in split_df.iterrows():
+                    f.write(f"{row['__file']}, {int(row['__exp'])}, {int(row['__icm'])}, {int(row['__te'])}\n")
+    else:
+        _write_split(train_df, output_dir, "train")
+        _write_split(val_df, output_dir, "val")
 
     testset_path = output_dir / "testset_filenames.csv"
     with testset_path.open("w", encoding="utf-8") as f:
