@@ -254,31 +254,46 @@ def _resolve_blastocyst_group_col(df: pd.DataFrame, split_cfg: dict) -> Optional
     return group_col
 
 
-def _extract_morph_labels(row: pd.Series):
+def _infer_zero_based(series: pd.Series, max_value: int) -> bool:
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = numeric[~numeric.isna()]
+    if numeric.empty:
+        return False
+    vmin = int(numeric.min())
+    vmax = int(numeric.max())
+    return vmin >= 0 and vmax <= max_value
+
+
+def _extract_morph_labels(
+    row: pd.Series,
+    exp_zero_based: bool,
+    icm_zero_based: bool,
+    te_zero_based: bool,
+):
     grade = row.get("grade")
     if grade is None:
         grade = row.get("gardner")
     components = parse_gardner_components(grade) if grade is not None else None
     exp_raw = row.get("exp")
-    exp_id = normalize_silver_exp(exp_raw)
+    exp_id = normalize_silver_exp(exp_raw) if exp_zero_based else None
     exp = exp_id + 1 if exp_id is not None else None
-    if exp is None:
+    if exp is None and not exp_zero_based:
         exp = normalize_gardner_exp(exp_raw)
     if exp is None and components is not None:
         exp = components[0]
 
     icm_raw = row.get("icm")
-    icm_id = normalize_silver_grade(icm_raw)
+    icm_id = normalize_silver_grade(icm_raw) if icm_zero_based else None
     icm = ICM_CLASSES[icm_id] if icm_id is not None else None
-    if icm is None:
+    if icm is None and not icm_zero_based:
         icm = normalize_gardner_grade(icm_raw)
     if icm is None and components is not None:
         icm = components[1]
 
     te_raw = row.get("te")
-    te_id = normalize_silver_grade(te_raw)
+    te_id = normalize_silver_grade(te_raw) if te_zero_based else None
     te = TE_CLASSES[te_id] if te_id is not None else None
-    if te is None:
+    if te is None and not te_zero_based:
         te = normalize_gardner_grade(te_raw)
     if te is None and components is not None:
         te = components[2]
@@ -311,6 +326,10 @@ def _split_by_group_stratified(
     if group_col not in df.columns:
         raise ValueError(f"group_col={group_col} missing from blastocyst metadata.")
 
+    exp_zero_based = "exp" in df.columns and _infer_zero_based(df["exp"], max_value=4)
+    icm_zero_based = "icm" in df.columns and _infer_zero_based(df["icm"], max_value=3)
+    te_zero_based = "te" in df.columns and _infer_zero_based(df["te"], max_value=3)
+
     group_ids = []
     for idx, value in df[group_col].items():
         text = str(value).strip()
@@ -321,7 +340,7 @@ def _split_by_group_stratified(
 
     exp_values = []
     for _, row in df.iterrows():
-        exp, _, _ = _extract_morph_labels(row)
+        exp, _, _ = _extract_morph_labels(row, exp_zero_based, icm_zero_based, te_zero_based)
         exp_values.append(exp)
     exp_counts = {exp: exp_values.count(exp) for exp in EXPANSION_CLASSES if exp in exp_values}
     exp_mode = _exp_bucket_mode(exp_counts, val_ratio, min_val_per_class)
@@ -334,7 +353,7 @@ def _split_by_group_stratified(
     icm_labels = []
     te_labels = []
     for _, row in df.iterrows():
-        exp, icm, te = _extract_morph_labels(row)
+        exp, icm, te = _extract_morph_labels(row, exp_zero_based, icm_zero_based, te_zero_based)
         if exp is None:
             exp_label = "missing"
         elif exp_mode == "exact":
@@ -630,13 +649,16 @@ def _morph_label_distribution(df: pd.DataFrame) -> dict:
     n_exp_labeled = 0
     n_icm_labeled = 0
     n_te_labeled = 0
+    exp_zero_based = "exp" in df.columns and _infer_zero_based(df["exp"], max_value=4)
+    icm_zero_based = "icm" in df.columns and _infer_zero_based(df["icm"], max_value=3)
+    te_zero_based = "te" in df.columns and _infer_zero_based(df["te"], max_value=3)
     for _, row in df.iterrows():
         grade = row.get("grade")
         components = parse_gardner_components(grade) if grade is not None else None
         exp_raw = row.get("exp")
-        exp_id = normalize_silver_exp(exp_raw)
+        exp_id = normalize_silver_exp(exp_raw) if exp_zero_based else None
         exp = exp_id + 1 if exp_id is not None else None
-        if exp is None:
+        if exp is None and not exp_zero_based:
             exp = normalize_gardner_exp(exp_raw)
         if exp is None and components is not None:
             exp = components[0]
@@ -647,18 +669,21 @@ def _morph_label_distribution(df: pd.DataFrame) -> dict:
             exp_counts[exp] += 1
         icm_raw = row.get("icm")
         te_raw = row.get("te")
-        icm_id = normalize_silver_grade(icm_raw)
-        te_id = normalize_silver_grade(te_raw)
+        icm_id = normalize_silver_grade(icm_raw) if icm_zero_based else None
+        te_id = normalize_silver_grade(te_raw) if te_zero_based else None
         icm = ICM_CLASSES[icm_id] if icm_id is not None else None
         te = TE_CLASSES[te_id] if te_id is not None else None
-        if icm is None:
+        if icm is None and not icm_zero_based:
             icm = normalize_gardner_grade(icm_raw)
-        if te is None:
+        if te is None and not te_zero_based:
             te = normalize_gardner_grade(te_raw)
         if icm is None and components is not None:
             icm = components[1]
         if te is None and components is not None:
             te = components[2]
+        if exp < 3:
+            icm = None
+            te = None
         if icm in icm_counts:
             icm_counts[icm] += 1
             n_icm_labeled += 1
