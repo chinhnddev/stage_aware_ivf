@@ -454,6 +454,11 @@ def main() -> None:
         json.dump(q_stats, f, indent=2)
 
     print(f"Saved morphology reports to {out_dir}")
+    print("EXP metrics:", metrics["exp"])
+    print("ICM metrics:", metrics["icm"])
+    print("TE metrics:", metrics["te"])
+    if q_stats:
+        print("Q-score stats:", q_stats)
 
 
 if __name__ == "__main__":

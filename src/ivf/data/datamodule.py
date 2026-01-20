@@ -163,6 +163,99 @@ def _is_silver_undefined(value) -> bool:
     return num == 3
 
 
+def _normalize_icm_te_label(raw_value, zero_based: bool) -> Optional[str]:
+    if zero_based:
+        label_id = normalize_silver_grade(raw_value)
+        if label_id is None:
+            return None
+        return ICM_CLASSES[label_id]
+    return normalize_gardner_grade(raw_value)
+
+
+def _debug_morph_sample_table(
+    df: pd.DataFrame,
+    exp_zero_based: bool,
+    icm_zero_based: bool,
+    te_zero_based: bool,
+    exp_max: int,
+    context: str,
+) -> None:
+    rows = []
+    for _, row in df.head(100).iterrows():
+        exp_raw = row.get("exp")
+        icm_raw = row.get("icm")
+        te_raw = row.get("te")
+        exp_id = None
+        exp_value = None
+        if exp_zero_based:
+            exp_id = normalize_silver_exp(exp_raw, exp_max=exp_max)
+        else:
+            exp_val = normalize_gardner_exp(exp_raw, exp_max=exp_max)
+            exp_id = (exp_val - 1) if exp_val is not None else None
+        if exp_id is not None:
+            exp_value = exp_id + 1
+
+        force_nd = exp_value is not None and exp_value < 3
+        icm_label = None
+        te_label = None
+        icm_mask = 0
+        te_mask = 0
+        if force_nd:
+            icm_label = "ND"
+            te_label = "ND"
+        else:
+            icm_label = _normalize_icm_te_label(icm_raw, icm_zero_based)
+            te_label = _normalize_icm_te_label(te_raw, te_zero_based)
+            if icm_label is None and (icm_zero_based and _is_silver_undefined(icm_raw)):
+                icm_label = "ND"
+            if te_label is None and (te_zero_based and _is_silver_undefined(te_raw)):
+                te_label = "ND"
+            icm_mask = 1 if icm_label in ICM_CLASSES else 0
+            te_mask = 1 if te_label in TE_CLASSES else 0
+
+        rows.append(
+            {
+                "raw_exp": exp_raw,
+                "raw_icm": icm_raw,
+                "raw_te": te_raw,
+                "normalized_exp": exp_value,
+                "normalized_icm": icm_label,
+                "normalized_te": te_label,
+                "mask_icm": icm_mask,
+                "mask_te": te_mask,
+            }
+        )
+
+    if rows:
+        sample_df = pd.DataFrame(rows)
+        get_logger("ivf").info("Morph %s sample mapping (first 100 rows):\n%s", context, sample_df.to_string(index=False))
+
+
+def _expected_morph_counts(
+    df: pd.DataFrame,
+    exp_zero_based: bool,
+    icm_zero_based: bool,
+    te_zero_based: bool,
+    exp_max: int,
+) -> Dict[str, Dict[str, int]]:
+    counts = {"icm": {cls: 0 for cls in ICM_CLASSES}, "te": {cls: 0 for cls in TE_CLASSES}}
+    for _, row in df.iterrows():
+        exp_raw = row.get("exp")
+        if exp_zero_based:
+            exp_id = normalize_silver_exp(exp_raw, exp_max=exp_max)
+            exp_value = exp_id + 1 if exp_id is not None else None
+        else:
+            exp_value = normalize_gardner_exp(exp_raw, exp_max=exp_max)
+        if exp_value is None or exp_value < 3:
+            continue
+        for head, zero_based in (("icm", icm_zero_based), ("te", te_zero_based)):
+            raw_value = row.get(head)
+            label = _normalize_icm_te_label(raw_value, zero_based)
+            if label in counts[head]:
+                counts[head][label] += 1
+    return counts
+
+
 def _log_morphology_train_stats(records: list, context: str) -> None:
     logger = get_logger("ivf")
     label_counts = {
@@ -283,6 +376,8 @@ def _build_morphology_records(
         icm_zero_based,
         te_zero_based,
     )
+    if context == "morph_train":
+        _debug_morph_sample_table(df, exp_zero_based, icm_zero_based, te_zero_based, exp_max, context=context)
     for _, row in df.iterrows():
         stats["total"] += 1
         grade = row.get("grade")
@@ -440,6 +535,15 @@ def _build_morphology_records(
     stats["exp_label_counts"] = exp_counts
     stats["icm_label_counts"] = icm_counts
     stats["te_label_counts"] = te_counts
+    expected_counts = _expected_morph_counts(df, exp_zero_based, icm_zero_based, te_zero_based, exp_max)
+    for head, counts in expected_counts.items():
+        expected_c = counts.get("C", 0)
+        actual_c = (icm_counts if head == "icm" else te_counts).get("C", 0)
+        if expected_c != actual_c:
+            raise ValueError(
+                f"Morph {context} {head} label count mismatch for C: expected={expected_c} actual={actual_c}. "
+                "Check label normalization and EXP<3 masking."
+            )
     get_logger("ivf").info("Blastocyst Gardner parsing stats (%s): %s", context, stats)
     return records
 
