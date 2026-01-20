@@ -233,9 +233,18 @@ def main() -> None:
         te_true = targets["te"].cpu().numpy().astype(int)
 
         outputs = model(images)
-        exp_logits = outputs["exp"]
-        icm_logits = outputs["icm"]
-        te_logits = outputs["te"]
+        # Our models return either:
+        # - {"exp": ..., "icm": ..., "te": ...} (legacy)
+        # - {"morph": {"exp": ..., "icm": ..., "te": ...}, ...} (current)
+        morph = outputs.get("morph") if isinstance(outputs, dict) else None
+        if isinstance(morph, dict):
+            exp_logits = morph["exp"]
+            icm_logits = morph["icm"]
+            te_logits = morph["te"]
+        else:
+            exp_logits = outputs["exp"]
+            icm_logits = outputs["icm"]
+            te_logits = outputs["te"]
         exp_pred = exp_logits.argmax(dim=-1).cpu().numpy().astype(int)
         icm_pred = icm_logits.argmax(dim=-1).cpu().numpy().astype(int)
         te_pred = te_logits.argmax(dim=-1).cpu().numpy().astype(int)
