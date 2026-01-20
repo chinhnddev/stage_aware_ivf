@@ -20,10 +20,12 @@ def build_model_from_config(cfg, phase: Optional[str] = None):
         morph_cfg = getattr(cfg.training, "morph", None)
         backbone = str(getattr(morph_cfg, "paper_backbone", "resnet50")) if morph_cfg is not None else "resnet50"
         pretrained = bool(getattr(morph_cfg, "paper_pretrained", True)) if morph_cfg is not None else True
+        exp_num_classes = int(getattr(morph_cfg, "exp_max", 5)) if morph_cfg is not None else 5
         return PaperMorphNet(
             backbone=backbone,  # type: ignore[arg-type]
             pretrained=pretrained,
             head_hidden_dim=int(getattr(model_cfg, "head_hidden_dim", 0)),
+            exp_num_classes=exp_num_classes,
         )
     if model_name in {"joint_morph", "morph_joint", "jointmorphnet"}:
         if phase is not None and phase != "morph":

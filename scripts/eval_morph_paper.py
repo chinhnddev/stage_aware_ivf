@@ -1,9 +1,11 @@
 """
 Paper-protocol morphology evaluation on Blastocyst-Dataset testset_filenames.csv.
 
-Protocol (paper reproduction):
-- EXP binary: exp_bin = (raw_exp >= 3) where raw_exp is 0..4
-- ICM/TE 4-class: 0=A, 1=B, 2=C, 3=ND (no masking)
+Protocol (paper reproduction, matching reference repo scripts):
+- EXP 5-class: 0..4 (0=EXP1 ... 4=EXP5)
+- ICM/TE 4-class: 0=A, 1=B, 2=C, 3=ND
+- ICM/TE metrics are computed ONLY on samples where BOTH exp_pred and exp_gt are >=3
+  (i.e., exp label not in {0,1}), matching calculate_model_metrics.py.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from ivf.utils.logging import get_logger
 
 
 PAPER_CLASSES_4 = ["A", "B", "C", "ND"]
+EXP_LABELS = ["0", "1", "2", "3", "4", "5"]  # 5 = not assessable (paper script)
 
 
 def _coerce_int(value) -> Optional[int]:
@@ -90,12 +93,21 @@ def _build_test_records(metadata_csv: Path, testset_df: pd.DataFrame) -> list:
         if raw_exp is None or raw_icm is None or raw_te is None:
             invalid += 1
             continue
-        if not (0 <= raw_exp <= 4 and 0 <= raw_icm <= 3 and 0 <= raw_te <= 3):
+        # Match paper script normalization (invalid -> "not assessable"):
+        # - EXP: invalid -> 5
+        # - ICM/TE: invalid -> 3 (ND)
+        if raw_exp < 0 or raw_exp > 4:
+            raw_exp = 5
+        if raw_icm < 0 or raw_icm > 2:
+            raw_icm = 3
+        if raw_te < 0 or raw_te > 2:
+            raw_te = 3
+        if raw_exp == 5:
             invalid += 1
             continue
-        exp_bin = 1 if raw_exp >= 3 else 0
+        exp_label = raw_exp
         targets = {
-            "exp": exp_bin,
+            "exp": exp_label,
             "icm": raw_icm,
             "te": raw_te,
             "exp_mask": 1,
@@ -210,8 +222,8 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     y_exp_true, y_exp_pred = [], []
-    y_icm_true, y_icm_pred = [], []
-    y_te_true, y_te_pred = [], []
+    y_icm_true_all, y_icm_pred_all = [], []
+    y_te_true_all, y_te_pred_all = [], []
 
     for batch in loader:
         images = batch["image"].to(torch_device)
@@ -230,26 +242,33 @@ def main() -> None:
 
         y_exp_true.append(exp_true)
         y_exp_pred.append(exp_pred)
-        y_icm_true.append(icm_true)
-        y_icm_pred.append(icm_pred)
-        y_te_true.append(te_true)
-        y_te_pred.append(te_pred)
+        y_icm_true_all.append(icm_true)
+        y_icm_pred_all.append(icm_pred)
+        y_te_true_all.append(te_true)
+        y_te_pred_all.append(te_pred)
 
     y_exp_true = np.concatenate(y_exp_true)
     y_exp_pred = np.concatenate(y_exp_pred)
-    y_icm_true = np.concatenate(y_icm_true)
-    y_icm_pred = np.concatenate(y_icm_pred)
-    y_te_true = np.concatenate(y_te_true)
-    y_te_pred = np.concatenate(y_te_pred)
+    y_icm_true_all = np.concatenate(y_icm_true_all)
+    y_icm_pred_all = np.concatenate(y_icm_pred_all)
+    y_te_true_all = np.concatenate(y_te_true_all)
+    y_te_pred_all = np.concatenate(y_te_pred_all)
 
-    exp_metrics, exp_cm = _compute_metrics(y_exp_true, y_exp_pred, labels=[0, 1])
+    # Match reference repo evaluation: only consider ICM/TE when exp_pred and exp_gt are >=3 (i.e., not in {0,1})
+    gate = (y_exp_true >= 2) & (y_exp_pred >= 2)
+    y_icm_true = y_icm_true_all[gate]
+    y_icm_pred = y_icm_pred_all[gate]
+    y_te_true = y_te_true_all[gate]
+    y_te_pred = y_te_pred_all[gate]
+
+    exp_metrics, exp_cm = _compute_metrics(y_exp_true, y_exp_pred, labels=[0, 1, 2, 3, 4, 5])
     icm_metrics, icm_cm = _compute_metrics(y_icm_true, y_icm_pred, labels=[0, 1, 2, 3])
     te_metrics, te_cm = _compute_metrics(y_te_true, y_te_pred, labels=[0, 1, 2, 3])
 
     (output_dir / "metrics_exp.json").write_text(json.dumps(exp_metrics, indent=2), encoding="utf-8")
     (output_dir / "metrics_icm.json").write_text(json.dumps(icm_metrics, indent=2), encoding="utf-8")
     (output_dir / "metrics_te.json").write_text(json.dumps(te_metrics, indent=2), encoding="utf-8")
-    pd.DataFrame(exp_cm, index=["0", "1"], columns=["0", "1"]).to_csv(output_dir / "confusion_exp.csv")
+    pd.DataFrame(exp_cm, index=EXP_LABELS, columns=EXP_LABELS).to_csv(output_dir / "confusion_exp.csv")
     pd.DataFrame(icm_cm, index=PAPER_CLASSES_4, columns=PAPER_CLASSES_4).to_csv(output_dir / "confusion_icm.csv")
     pd.DataFrame(te_cm, index=PAPER_CLASSES_4, columns=PAPER_CLASSES_4).to_csv(output_dir / "confusion_te.csv")
 
@@ -257,6 +276,7 @@ def main() -> None:
     logger.info("EXP metrics: %s", exp_metrics)
     logger.info("ICM metrics: %s", icm_metrics)
     logger.info("TE metrics: %s", te_metrics)
+    logger.info("ICM/TE eval gate: kept=%s / total=%s", int(gate.sum()), int(gate.shape[0]))
 
 
 if __name__ == "__main__":

@@ -590,7 +590,7 @@ def _build_paper_morphology_records(
     logger = get_logger("ivf")
     records = []
     counts = {
-        "exp_bin": {0: 0, 1: 0},
+        "exp": {i: 0 for i in range(5)},
         "icm": {cls: 0 for cls in PAPER_ICM_CLASSES},
         "te": {cls: 0 for cls in PAPER_TE_CLASSES},
     }
@@ -615,10 +615,12 @@ def _build_paper_morphology_records(
             stats["invalid_te"] += 1
             continue
 
-        exp_bin = 1 if exp_raw_int >= 3 else 0
+        # Paper repo uses EXP in {0..4} (0=EXP1 ... 4=EXP5). For ICM/TE evaluation,
+        # they later exclude samples when exp_pred or exp_gt is in {0,1} (EXP<3).
+        exp_label = exp_raw_int
         icm_label = _paper_label_name(icm_raw_int, "icm")
         te_label = _paper_label_name(te_raw_int, "te")
-        counts["exp_bin"][exp_bin] += 1
+        counts["exp"][exp_label] += 1
         counts["icm"][icm_label] += 1
         counts["te"][te_label] += 1
 
@@ -626,7 +628,7 @@ def _build_paper_morphology_records(
             mapping_rows.append(
                 {
                     "raw_exp": exp_raw_int,
-                    "exp_bin": exp_bin,
+                    "exp": exp_label,
                     "raw_icm": icm_raw_int,
                     "icm_label": icm_label,
                     "raw_te": te_raw_int,
@@ -635,7 +637,7 @@ def _build_paper_morphology_records(
             )
 
         targets = make_full_target_dict(
-            exp=exp_bin,
+            exp=exp_label,
             icm=icm_raw_int,
             te=te_raw_int,
             exp_mask=1,
@@ -647,7 +649,7 @@ def _build_paper_morphology_records(
             "dataset": row.get("dataset", "blastocyst"),
             "grade": row.get("grade"),
             "exp_raw": exp_raw_int,
-            "exp_bin": exp_bin,
+            "exp": exp_label,
             "icm": icm_label,
             "te": te_label,
         }
@@ -1085,14 +1087,14 @@ class IVFDataModule(pl.LightningDataModule):
                     context="morph_val",
                 )
                 logger.info(
-                    "Morph paper train counts: exp_bin=%s icm=%s te=%s",
-                    train_counts["exp_bin"],
+                    "Morph paper train counts: exp=%s icm=%s te=%s",
+                    train_counts["exp"],
                     train_counts["icm"],
                     train_counts["te"],
                 )
                 logger.info(
-                    "Morph paper val counts: exp_bin=%s icm=%s te=%s",
-                    val_counts["exp_bin"],
+                    "Morph paper val counts: exp=%s icm=%s te=%s",
+                    val_counts["exp"],
                     val_counts["icm"],
                     val_counts["te"],
                 )

@@ -1,7 +1,10 @@
 """
 Paper reproduction morphology model:
 - Encoder: torchvision ResNet/EfficientNet (ImageNet weights optional)
-- Heads: EXP binary (2-class logits), ICM 4-class (A/B/C/ND), TE 4-class (A/B/C/ND)
+- Heads: EXP 5-class (0..4), ICM 4-class (A/B/C/ND=0..3), TE 4-class (A/B/C/ND=0..3)
+
+Metrics for ICM/TE are later computed only on the subset where EXP>=3 for both
+prediction and ground-truth, matching the reference repo scripts.
 
 This intentionally avoids the custom MorphologyBackbone used in JointMorphNet.
 """
@@ -62,6 +65,7 @@ class PaperMorphNet(nn.Module):
         backbone: PaperBackboneName = "resnet50",
         pretrained: bool = True,
         head_hidden_dim: int = 0,
+        exp_num_classes: int = 5,
     ) -> None:
         super().__init__()
         self.encoder, feature_dim, encoder_name = build_paper_encoder(backbone, pretrained)
@@ -69,11 +73,11 @@ class PaperMorphNet(nn.Module):
         self.morph = MorphologyHeads(
             feature_dim,
             hidden_dim=head_hidden_dim,
-            exp_classes=2,
+            exp_classes=int(exp_num_classes),
             icm_classes=4,
             te_classes=4,
         )
-        self.exp_num_classes = 2
+        self.exp_num_classes = int(exp_num_classes)
         self.icm_num_classes = 4
         self.te_num_classes = 4
 
@@ -85,4 +89,3 @@ class PaperMorphNet(nn.Module):
             features = torch.flatten(features, 1)
         morph_logits = self.morph(features)
         return {"features": features, "morph": morph_logits}
-

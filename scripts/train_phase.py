@@ -1231,7 +1231,8 @@ def main():
     morph_single_head = str(getattr(morph_cfg, "single_task_head", "exp")) if morph_cfg is not None else "exp"
     morph_exp_max = int(getattr(morph_cfg, "exp_max", 5)) if morph_cfg is not None else 5
     morph_protocol = str(getattr(morph_cfg, "protocol", "gardner")).lower() if morph_cfg is not None else "gardner"
-    morph_exp_num_classes = 2 if morph_protocol == "paper" else morph_exp_max
+    # Paper repo uses 5-class EXP (0..4). Our "paper" protocol matches that.
+    morph_exp_num_classes = 5 if morph_protocol == "paper" else morph_exp_max
     morph_lambda_icm = float(getattr(morph_cfg, "lambda_icm", 1.0)) if morph_cfg is not None else 1.0
     morph_lambda_te = float(getattr(morph_cfg, "lambda_te", 1.0)) if morph_cfg is not None else 1.0
     morph_use_focal_icm = bool(getattr(morph_cfg, "use_focal_icm", False)) if morph_cfg is not None else False

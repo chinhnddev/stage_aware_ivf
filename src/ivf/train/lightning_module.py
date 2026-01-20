@@ -765,6 +765,9 @@ class MultiTaskLightningModule(pl.LightningModule):
         targets = batch["targets"]
 
         if self.phase in {"morph", "joint"}:
+            exp_pred = None
+            exp_gt = None
+            exp_gate = None
             if self._is_head_active("exp") and "exp_acc" in self.morph_metrics:
                 t = targets["exp"]
                 if self.morph_protocol == "paper":
@@ -777,11 +780,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                 if self._val_counts is not None:
                     self._val_counts["exp"] += exp_n
                 if exp_n > 0:
-                    preds = outputs["morph"]["exp"][:, : self.exp_num_classes].argmax(dim=-1)
-                    self.morph_metrics["exp_acc"].update(preds[mask], t[mask])
+                    exp_logits = outputs["morph"]["exp"][:, : self.exp_num_classes]
+                    exp_pred = exp_logits.argmax(dim=-1)
+                    exp_gt = t
+                    if self.morph_protocol == "paper":
+                        # Match reference repo evaluation: only consider ICM/TE when BOTH
+                        # predicted exp and gt exp are >=3 (i.e., exp label not in {0,1}).
+                        exp_gate = (exp_pred >= 2) & (exp_gt >= 2)
+                    self.morph_metrics["exp_acc"].update(exp_pred[mask], t[mask])
                     self.log("val/exp_acc", self.morph_metrics["exp_acc"], on_epoch=True, prog_bar=False, batch_size=batch_size)
                     if "exp_macro_f1" in self.morph_metrics:
-                        self.morph_metrics["exp_macro_f1"].update(preds[mask], t[mask])
+                        self.morph_metrics["exp_macro_f1"].update(exp_pred[mask], t[mask])
                         self.log(
                             "val/exp_macro_f1",
                             self.morph_metrics["exp_macro_f1"],
@@ -796,6 +805,8 @@ class MultiTaskLightningModule(pl.LightningModule):
                 t = targets[head]
                 if self.morph_protocol == "paper":
                     mask = t >= 0
+                    if exp_gate is not None:
+                        mask = mask & exp_gate
                 else:
                     mask = targets.get(f"{head}_mask")
                     mask = mask > 0 if mask is not None else t >= 0
@@ -827,6 +838,8 @@ class MultiTaskLightningModule(pl.LightningModule):
                     num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes
                     if self.morph_protocol == "paper":
                         mask = t >= 0
+                        if exp_gate is not None:
+                            mask = mask & exp_gate
                     else:
                         mask = targets.get(f"{head}_mask")
                         mask = mask > 0 if mask is not None else t >= 0
@@ -1078,7 +1091,10 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         logger = get_logger("ivf")
         if self.morph_protocol == "paper":
-            logger.info("Morph train exp_bin counts: %s", {0: int(counts["exp"][0]), 1: int(counts["exp"][1])})
+            logger.info(
+                "Morph train exp counts: %s",
+                {i: int(counts["exp"][i]) for i in range(min(self.exp_num_classes, int(counts["exp"].numel())))},
+            )
         else:
             logger.info(
                 "Morph train exp counts: %s",

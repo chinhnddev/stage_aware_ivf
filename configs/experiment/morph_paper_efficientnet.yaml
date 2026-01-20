@@ -22,6 +22,7 @@ training:
     protocol: paper
     paper_backbone: efficientnet_b0
     paper_pretrained: true
+    exp_max: 5
   mtl:
     grad_strategy: pcgrad
 
