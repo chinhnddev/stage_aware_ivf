@@ -90,6 +90,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         use_focal_te: bool = False,
         focal_gamma: float = 2.0,
         live_epoch_line: bool = False,
+        morph_protocol: str = "gardner",
     ) -> None:
         super().__init__()
         self.model = model
@@ -125,6 +126,7 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.q_aux_alpha = q_aux_alpha
         self.q_freeze_backbone = q_freeze_backbone
         self.live_epoch_line = live_epoch_line
+        self.morph_protocol = str(morph_protocol or "gardner").lower()
         self._epoch_start_time = None
         self._val_pred_counts = None
         self._val_true_counts = None
@@ -136,8 +138,12 @@ class MultiTaskLightningModule(pl.LightningModule):
         self.icm_class_weight = None
         self.te_class_weight = None
         self.exp_num_classes = exp_num_classes or len(EXPANSION_CLASSES)
-        self.icm_num_classes = len(ICM_CLASSES)
-        self.te_num_classes = len(TE_CLASSES)
+        if self.morph_protocol == "paper":
+            self.icm_num_classes = 4
+            self.te_num_classes = 4
+        else:
+            self.icm_num_classes = len(ICM_CLASSES)
+            self.te_num_classes = len(TE_CLASSES)
         self.exp_class_counts = None
         self.icm_class_counts = None
         self.te_class_counts = None
@@ -166,7 +172,13 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         self._apply_phase_freeze(initial=True)
 
-        self.morph_metrics = nn.ModuleDict(build_morphology_metrics(exp_num_classes=self.exp_num_classes))
+        self.morph_metrics = nn.ModuleDict(
+            build_morphology_metrics(
+                exp_num_classes=self.exp_num_classes,
+                icm_num_classes=self.icm_num_classes,
+                te_num_classes=self.te_num_classes,
+            )
+        )
         self.stage_metrics = nn.ModuleDict(build_stage_metrics())
         self.quality_metrics = nn.ModuleDict(build_quality_metrics())
 
@@ -482,21 +494,31 @@ class MultiTaskLightningModule(pl.LightningModule):
         if not self._is_head_active("exp"):
             pass
         else:
-            losses["exp"] = self._masked_ce(
-                outputs["morph"]["exp"],
-                targets["exp"],
-                targets.get("exp_mask"),
-                base_weight,
-                class_weight=self.exp_class_weight,
-                num_classes=self.exp_num_classes,
-            )
+            if self.morph_protocol == "paper":
+                losses["exp"] = self._masked_ce(
+                    outputs["morph"]["exp"],
+                    targets["exp"],
+                    None,
+                    base_weight,
+                    class_weight=self.exp_class_weight,
+                    num_classes=self.exp_num_classes,
+                )
+            else:
+                losses["exp"] = self._masked_ce(
+                    outputs["morph"]["exp"],
+                    targets["exp"],
+                    targets.get("exp_mask"),
+                    base_weight,
+                    class_weight=self.exp_class_weight,
+                    num_classes=self.exp_num_classes,
+                )
 
         if self._is_head_active("icm"):
             if self.use_focal_icm:
                 losses["icm"] = self._masked_focal_loss(
                     outputs["morph"]["icm"],
                     targets["icm"],
-                    targets.get("icm_mask"),
+                    None if self.morph_protocol == "paper" else targets.get("icm_mask"),
                     base_weight * float(self.morph_lambda_icm),
                     gamma=self.focal_gamma,
                     class_weight=self.icm_class_weight,
@@ -506,7 +528,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                 losses["icm"] = self._masked_ce(
                     outputs["morph"]["icm"],
                     targets["icm"],
-                    targets.get("icm_mask"),
+                    None if self.morph_protocol == "paper" else targets.get("icm_mask"),
                     base_weight * float(self.morph_lambda_icm),
                     class_weight=self.icm_class_weight,
                     num_classes=self.icm_num_classes,
@@ -517,7 +539,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                 losses["te"] = self._masked_focal_loss(
                     outputs["morph"]["te"],
                     targets["te"],
-                    targets.get("te_mask"),
+                    None if self.morph_protocol == "paper" else targets.get("te_mask"),
                     base_weight * float(self.morph_lambda_te),
                     gamma=self.focal_gamma,
                     class_weight=self.te_class_weight,
@@ -527,7 +549,7 @@ class MultiTaskLightningModule(pl.LightningModule):
                 losses["te"] = self._masked_ce(
                     outputs["morph"]["te"],
                     targets["te"],
-                    targets.get("te_mask"),
+                    None if self.morph_protocol == "paper" else targets.get("te_mask"),
                     base_weight * float(self.morph_lambda_te),
                     class_weight=self.te_class_weight,
                     num_classes=self.te_num_classes,
@@ -745,8 +767,11 @@ class MultiTaskLightningModule(pl.LightningModule):
         if self.phase in {"morph", "joint"}:
             if self._is_head_active("exp") and "exp_acc" in self.morph_metrics:
                 t = targets["exp"]
-                mask = targets.get("exp_mask")
-                mask = mask > 0 if mask is not None else t >= 0
+                if self.morph_protocol == "paper":
+                    mask = t >= 0
+                else:
+                    mask = targets.get("exp_mask")
+                    mask = mask > 0 if mask is not None else t >= 0
                 mask = mask & (t < self.exp_num_classes)
                 exp_n = int(mask.sum().item())
                 if self._val_counts is not None:
@@ -769,8 +794,11 @@ class MultiTaskLightningModule(pl.LightningModule):
                 if not self._is_head_active(head):
                     continue
                 t = targets[head]
-                mask = targets.get(f"{head}_mask")
-                mask = mask > 0 if mask is not None else t >= 0
+                if self.morph_protocol == "paper":
+                    mask = t >= 0
+                else:
+                    mask = targets.get(f"{head}_mask")
+                    mask = mask > 0 if mask is not None else t >= 0
                 mask = mask & (t < num_classes)
                 head_n = int(mask.sum().item())
                 if self._val_counts is not None:
@@ -791,13 +819,17 @@ class MultiTaskLightningModule(pl.LightningModule):
                         self._val_manual_total[head] += int(total)
 
             if self._val_pred_counts is not None:
-                for head, classes in (("icm", ICM_CLASSES), ("te", TE_CLASSES)):
+                paper_classes = ["A", "B", "C", "ND"]
+                for head, classes in (("icm", paper_classes if self.morph_protocol == "paper" else ICM_CLASSES), ("te", paper_classes if self.morph_protocol == "paper" else TE_CLASSES)):
                     if not self._is_head_active(head):
                         continue
                     t = targets[head]
-                    mask = targets.get(f"{head}_mask")
                     num_classes = self.icm_num_classes if head == "icm" else self.te_num_classes
-                    mask = mask > 0 if mask is not None else t >= 0
+                    if self.morph_protocol == "paper":
+                        mask = t >= 0
+                    else:
+                        mask = targets.get(f"{head}_mask")
+                        mask = mask > 0 if mask is not None else t >= 0
                     mask = mask & (t < num_classes)
                     if mask.any():
                         mask_cpu = mask.detach().cpu()
@@ -1018,8 +1050,8 @@ class MultiTaskLightningModule(pl.LightningModule):
 
         counts = {
             "exp": torch.zeros(self.exp_num_classes, dtype=torch.long),
-            "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
-            "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
+            "icm": torch.zeros(self.icm_num_classes, dtype=torch.long),
+            "te": torch.zeros(self.te_num_classes, dtype=torch.long),
         }
 
         def _iter_samples(ds):
@@ -1033,30 +1065,37 @@ class MultiTaskLightningModule(pl.LightningModule):
         for sample in _iter_samples(dataset):
             targets = sample.get("targets", {})
             exp_label = targets.get("exp", IGNORE_INDEX)
-            exp_mask = targets.get("exp_mask", 0)
+            exp_mask = 1 if self.morph_protocol == "paper" else targets.get("exp_mask", 0)
             if exp_mask and exp_label is not None and exp_label >= 0:
                 if exp_label < counts["exp"].numel():
                     counts["exp"][int(exp_label)] += 1
             for head in ("icm", "te"):
                 label = targets.get(head, IGNORE_INDEX)
-                mask = targets.get(f"{head}_mask", 0)
+                mask = 1 if self.morph_protocol == "paper" else targets.get(f"{head}_mask", 0)
                 if mask and label is not None and label >= 0:
                     if label < counts[head].numel():
                         counts[head][int(label)] += 1
 
         logger = get_logger("ivf")
-        logger.info(
-            "Morph train exp counts: %s",
-            {exp: int(counts["exp"][i]) for i, exp in enumerate(range(1, self.exp_num_classes + 1))},
-        )
-        logger.info("Morph train icm counts: %s", {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)})
-        logger.info("Morph train te counts: %s", {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)})
+        if self.morph_protocol == "paper":
+            logger.info("Morph train exp_bin counts: %s", {0: int(counts["exp"][0]), 1: int(counts["exp"][1])})
+        else:
+            logger.info(
+                "Morph train exp counts: %s",
+                {exp: int(counts["exp"][i]) for i, exp in enumerate(range(1, self.exp_num_classes + 1))},
+            )
+        if self.morph_protocol == "paper":
+            paper_classes = ["A", "B", "C", "ND"]
+            logger.info("Morph train icm counts: %s", {cls: int(counts["icm"][i]) for i, cls in enumerate(paper_classes)})
+            logger.info("Morph train te counts: %s", {cls: int(counts["te"][i]) for i, cls in enumerate(paper_classes)})
+        else:
+            logger.info("Morph train icm counts: %s", {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)})
+            logger.info("Morph train te counts: %s", {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)})
         self.exp_class_counts = counts["exp"].clone()
         self.icm_class_counts = counts["icm"].clone()
         self.te_class_counts = counts["te"].clone()
 
-        self.icm_num_classes = len(ICM_CLASSES)
-        self.te_num_classes = len(TE_CLASSES)
+        # keep configured num classes (paper=4, gardner=3)
 
         def _imbalance_ratio(head_counts: torch.Tensor, num_classes: int) -> Optional[float]:
             if num_classes <= 0:

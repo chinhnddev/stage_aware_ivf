@@ -1,9 +1,7 @@
 base_config: configs/experiment/base.yaml
 
 model:
-  name: joint_morph
-  fusion_mode: sum
-  attention_type: eca
+  name: morph_paper
 
 transforms:
   image_size: 224
@@ -20,11 +18,12 @@ training:
   min_lr: 0.000001
   ema_decay: 0.999
   morph:
-    mode: single_task
-    single_task_head: exp
-    exp_max: 5
+    mode: multi_task
+    protocol: paper
+    paper_backbone: efficientnet_b0
+    paper_pretrained: true
   mtl:
-    grad_strategy: none
+    grad_strategy: pcgrad
 
 morph_score:
   weights:

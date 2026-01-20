@@ -2,4 +2,5 @@ base_config: configs/experiment/base.yaml
 
 model:
   heads:
-    quality_conditioning: stage
+    quality_conditioning: none
+

@@ -21,7 +21,7 @@ training:
   ema_decay: 0.999
   morph:
     mode: single_task
-    single_task_head: te
+    single_task_head: exp
     exp_max: 5
   mtl:
     grad_strategy: none
@@ -35,3 +35,4 @@ morph_score:
   neutral_icm_score: 2.0
   neutral_te_score: 2.0
   confidence_lambda: 0.0
+

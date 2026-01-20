@@ -6,6 +6,7 @@ from typing import Optional
 
 from ivf.models.morph_backbone import MorphologyBackbone
 from ivf.models.morph_joint import JointMorphNet
+from ivf.models.morph_paper import PaperMorphNet
 from ivf.models.multitask import MultiTaskEmbryoNet
 
 
@@ -13,6 +14,17 @@ def build_model_from_config(cfg, phase: Optional[str] = None):
     model_cfg = cfg.model
     encoder_cfg = model_cfg.encoder
     model_name = str(getattr(model_cfg, "name", "multitask")).lower()
+    if model_name in {"morph_paper", "paper_morph", "paper"}:
+        if phase is not None and phase != "morph":
+            raise ValueError(f"Model {model_name} is only supported for phase=morph.")
+        morph_cfg = getattr(cfg.training, "morph", None)
+        backbone = str(getattr(morph_cfg, "paper_backbone", "resnet50")) if morph_cfg is not None else "resnet50"
+        pretrained = bool(getattr(morph_cfg, "paper_pretrained", True)) if morph_cfg is not None else True
+        return PaperMorphNet(
+            backbone=backbone,  # type: ignore[arg-type]
+            pretrained=pretrained,
+            head_hidden_dim=int(getattr(model_cfg, "head_hidden_dim", 0)),
+        )
     if model_name in {"joint_morph", "morph_joint", "jointmorphnet"}:
         if phase is not None and phase != "morph":
             raise ValueError(f"Model {model_name} is only supported for phase=morph.")

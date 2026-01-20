@@ -93,6 +93,8 @@ class MorphTrainingConfig:
     finetune_stage2_lr: float = 1e-5
     finetune_unfreeze_last_blocks: int = 1
     protocol: str = "paper"
+    paper_backbone: str = "resnet50"
+    paper_pretrained: bool = True
 
 
 @dataclass

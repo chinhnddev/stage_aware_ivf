@@ -2,8 +2,8 @@ base_config: configs/experiment/phase1_morph_multi_task.yaml
 
 model:
   name: joint_morph
-  width_mult: 3.0
-  depth_mult: 2.0
+  width_mult: 4.0
+  depth_mult: 3.0
 
 training:
   init_ckpt_imagenet: outputs/pretrain/imagenet_best.ckpt
@@ -15,3 +15,4 @@ training:
     finetune_stage1_lr: 0.0001
     finetune_stage2_lr: 0.00001
     finetune_unfreeze_last_blocks: 2
+

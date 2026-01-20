@@ -169,10 +169,10 @@ def _unfreeze_encoder(model, logger) -> None:
     logger.info("Stage2 finetune: encoder fully unfrozen.")
 
 
-def _summarize_morph_counts(dataset):
+def _summarize_morph_counts(dataset, icm_num_classes: int, te_num_classes: int, *, use_masks: bool = True):
     counts = {
-        "icm": torch.zeros(len(ICM_CLASSES), dtype=torch.long),
-        "te": torch.zeros(len(TE_CLASSES), dtype=torch.long),
+        "icm": torch.zeros(icm_num_classes, dtype=torch.long),
+        "te": torch.zeros(te_num_classes, dtype=torch.long),
     }
 
     def _iter_samples(ds):
@@ -187,7 +187,7 @@ def _summarize_morph_counts(dataset):
         targets = sample.get("targets", {})
         for head in ("icm", "te"):
             label = targets.get(head, IGNORE_INDEX)
-            mask = targets.get(f"{head}_mask", 0)
+            mask = targets.get(f"{head}_mask", 0) if use_masks else 1
             if mask and label is not None and label >= 0:
                 if label < counts[head].numel():
                     counts[head][int(label)] += 1
@@ -1230,6 +1230,8 @@ def main():
     morph_mode = str(getattr(morph_cfg, "mode", "multi_task")) if morph_cfg is not None else "multi_task"
     morph_single_head = str(getattr(morph_cfg, "single_task_head", "exp")) if morph_cfg is not None else "exp"
     morph_exp_max = int(getattr(morph_cfg, "exp_max", 5)) if morph_cfg is not None else 5
+    morph_protocol = str(getattr(morph_cfg, "protocol", "gardner")).lower() if morph_cfg is not None else "gardner"
+    morph_exp_num_classes = 2 if morph_protocol == "paper" else morph_exp_max
     morph_lambda_icm = float(getattr(morph_cfg, "lambda_icm", 1.0)) if morph_cfg is not None else 1.0
     morph_lambda_te = float(getattr(morph_cfg, "lambda_te", 1.0)) if morph_cfg is not None else 1.0
     morph_use_focal_icm = bool(getattr(morph_cfg, "use_focal_icm", False)) if morph_cfg is not None else False
@@ -1347,7 +1349,7 @@ def main():
         morph_mode=morph_mode,
         single_task_head=morph_single_head,
         mtl_grad_strategy=mtl_grad_strategy,
-        exp_num_classes=morph_exp_max,
+        exp_num_classes=morph_exp_num_classes,
         morph_lambda_icm=morph_lambda_icm,
         morph_lambda_te=morph_lambda_te,
         quality_pos_weight=quality_pos_weight,
@@ -1363,6 +1365,7 @@ def main():
         use_focal_te=morph_use_focal_te,
         focal_gamma=morph_focal_gamma,
         live_epoch_line=args.live_epoch_line,
+        morph_protocol=morph_protocol,
     )
 
     prev_ckpt = get_prev_checkpoint(phase, checkpoints_dir, cfg)
@@ -1393,7 +1396,7 @@ def main():
                 morph_mode=morph_mode,
                 single_task_head=morph_single_head,
                 mtl_grad_strategy=mtl_grad_strategy,
-                exp_num_classes=morph_exp_max,
+                exp_num_classes=morph_exp_num_classes,
                 morph_lambda_icm=morph_lambda_icm,
                 morph_lambda_te=morph_lambda_te,
                 quality_pos_weight=quality_pos_weight,
@@ -1408,6 +1411,7 @@ def main():
                 use_focal_icm=morph_use_focal_icm,
                 use_focal_te=morph_use_focal_te,
                 focal_gamma=morph_focal_gamma,
+                morph_protocol=morph_protocol,
                 strict=True,
             )
         except RuntimeError as exc:
@@ -1465,11 +1469,19 @@ def main():
         pass
 
     if phase == "morph" and datamodule.train_dataset is not None:
-        counts = _summarize_morph_counts(datamodule.train_dataset)
-        icm_counts = {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)}
-        te_counts = {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)}
-        icm_num_classes = 2 if counts["icm"][2] == 0 else 3
-        te_num_classes = 2 if counts["te"][2] == 0 else 3
+        if morph_protocol == "paper":
+            paper_classes = ["A", "B", "C", "ND"]
+            counts = _summarize_morph_counts(datamodule.train_dataset, 4, 4, use_masks=False)
+            icm_counts = {cls: int(counts["icm"][i]) for i, cls in enumerate(paper_classes)}
+            te_counts = {cls: int(counts["te"][i]) for i, cls in enumerate(paper_classes)}
+            icm_num_classes = 4
+            te_num_classes = 4
+        else:
+            counts = _summarize_morph_counts(datamodule.train_dataset, len(ICM_CLASSES), len(TE_CLASSES))
+            icm_counts = {cls: int(counts["icm"][i]) for i, cls in enumerate(ICM_CLASSES)}
+            te_counts = {cls: int(counts["te"][i]) for i, cls in enumerate(TE_CLASSES)}
+            icm_num_classes = 2 if counts["icm"][2] == 0 else 3
+            te_num_classes = 2 if counts["te"][2] == 0 else 3
         icm_weights = None
         te_weights = None
         if morph_use_class_weights and morph_class_weight_mode == "inverse_freq":

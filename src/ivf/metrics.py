@@ -14,17 +14,19 @@ from torchmetrics.classification import (
 from ivf.data.label_schema import EXPANSION_CLASSES, ICM_CLASSES, STAGE_CLASSES, TE_CLASSES
 
 
-def build_morphology_metrics(exp_num_classes: int = None):
+def build_morphology_metrics(exp_num_classes: int = None, icm_num_classes: int = None, te_num_classes: int = None):
     exp_num_classes = len(EXPANSION_CLASSES) if exp_num_classes is None else exp_num_classes
+    icm_num_classes = len(ICM_CLASSES) if icm_num_classes is None else icm_num_classes
+    te_num_classes = len(TE_CLASSES) if te_num_classes is None else te_num_classes
     return {
         "exp_acc": MulticlassAccuracy(num_classes=exp_num_classes),
         "exp_macro_f1": MulticlassF1Score(num_classes=exp_num_classes, average="macro"),
-        "icm_acc": MulticlassAccuracy(num_classes=len(ICM_CLASSES)),
-        "icm_bal_acc": MulticlassAccuracy(num_classes=len(ICM_CLASSES), average="macro"),
-        "icm_macro_f1": MulticlassF1Score(num_classes=len(ICM_CLASSES), average="macro"),
-        "te_acc": MulticlassAccuracy(num_classes=len(TE_CLASSES)),
-        "te_bal_acc": MulticlassAccuracy(num_classes=len(TE_CLASSES), average="macro"),
-        "te_macro_f1": MulticlassF1Score(num_classes=len(TE_CLASSES), average="macro"),
+        "icm_acc": MulticlassAccuracy(num_classes=icm_num_classes),
+        "icm_bal_acc": MulticlassAccuracy(num_classes=icm_num_classes, average="macro"),
+        "icm_macro_f1": MulticlassF1Score(num_classes=icm_num_classes, average="macro"),
+        "te_acc": MulticlassAccuracy(num_classes=te_num_classes),
+        "te_bal_acc": MulticlassAccuracy(num_classes=te_num_classes, average="macro"),
+        "te_macro_f1": MulticlassF1Score(num_classes=te_num_classes, average="macro"),
     }
 
 
