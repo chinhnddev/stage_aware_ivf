@@ -32,7 +32,12 @@ def get_train_transforms(
     if crop_ratio is None:
         crop_ratio = (0.9, 1.1)
 
-    aug = [T.RandomResizedCrop(crop_size, scale=crop_scale, ratio=crop_ratio)]
+    # If crop_scale/ratio are fixed to 1.0, behave like the common "resize-only" baseline
+    # used in several reference notebooks (no random cropping).
+    if crop_scale == (1.0, 1.0) and crop_ratio == (1.0, 1.0):
+        aug = [T.Resize((crop_size, crop_size))]
+    else:
+        aug = [T.RandomResizedCrop(crop_size, scale=crop_scale, ratio=crop_ratio)]
     aug.append(T.RandomHorizontalFlip(p=0.5))
     if enable_vertical_flip:
         aug.append(T.RandomVerticalFlip(p=0.5))

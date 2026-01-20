@@ -1,0 +1,21 @@
+base_config: configs/experiment/morph_paper_resnet.yaml
+
+# Match the lightweight training recipe seen in reference notebook(s):
+# - Resize-only (no RandomResizedCrop)
+# - HFlip only, no rotation
+# - ImageNet normalization for ImageNet-pretrained backbones
+# - Smaller LR, disable PCGrad
+
+transforms:
+  train_crop_scale: [1.0, 1.0]
+  train_crop_ratio: [1.0, 1.0]
+  rotation_degrees: 0.0
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+training:
+  lr: 0.0001
+  weight_decay: 0.0001
+  mtl:
+    grad_strategy: none
+
